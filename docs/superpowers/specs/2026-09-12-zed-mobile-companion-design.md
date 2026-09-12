@@ -32,12 +32,15 @@ O Zed não reutiliza o protocolo, a marca, o esquema `orca://`, ícones ou asset
 
 ```text
 Zed desktop (host Tailscale)
-  ├─ MobileServer
+  ├─ crate mobile_protocol
+  │   └─ contrato JSON versionado, sem dependência de domínio/UI
+  ├─ crate mobile_server
   │   ├─ oferta QR e grants de dispositivos
   │   ├─ handshake autenticado e conexão WebSocket
   │   ├─ negociação de versão e capabilities
+  │   ├─ janela nativa Mobile e ação própria para abri-la
   │   └─ encaminhamento de RPC e subscriptions
-  ├─ adaptadores de domínio
+  ├─ crates adaptadores de domínio
   │   ├─ AgentThread / ConversationView
   │   ├─ TerminalThread / terminal vivo / sessão OMP persistida
   │   ├─ Project / worktree / árvore de arquivos
@@ -55,6 +58,12 @@ Zed Mobile (iOS/Android)
 ```
 
 `MobileServer` é uma fronteira assíncrona. Ele recebe mensagens de rede fora da thread de UI e agenda operações de domínio no contexto GPUI apropriado; entidades GPUI nunca cruzam a fronteira de thread. Cada operação devolve resultado estruturado e cada stream é cancelado quando o app ou a sessão remota é fechado.
+
+### Fronteira para atualizações upstream
+
+O companion fica em crates e diretório próprios: `mobile_protocol`, `mobile_server`, adaptadores móveis específicos de domínio e `mobile/`. A integração inicial no Zed fica limitada a registrar e inicializar `mobile_server` em um ponto do startup; a janela de controle, QR, configuração e grants pertencem ao novo crate e não alteram `settings_ui`.
+
+Os planos posteriores consomem APIs públicas existentes. Quando uma API atual não expuser o dado mínimo, a alteração no crate original deve ser um método público aditivo ou uma projeção DTO estreita, com teste focado no mesmo arquivo. Não são permitidos refactors amplos, mudanças de semântica existente, mover lógica de domínio para o companion ou editar arquivos originais apenas por estilo. A consequência é reduzir conflitos de merge e permitir atualizar o Zed upstream sem carregar um fork de `agent_ui`, `terminal`, `project`, `git` ou `settings_ui`.
 
 O servidor é iniciado somente após o usuário habilitar Mobile no Zed e selecionar um endereço Tailscale. Ele não aceita `127.0.0.1` como endereço anunciável para outro dispositivo, endereços wildcard, LAN comum, Relay ou interfaces públicas. A porta é estável por host, configurada quando Mobile é habilitado e mantida nos perfis pareados; mudar a porta exige atualizar o endpoint salvo ou parear novamente. Não é atribuída aleatoriamente, pois o aplicativo precisa reconectar após o host reiniciar.
 
