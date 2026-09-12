@@ -151,6 +151,7 @@ impl MobileServer {
                 let message = "failed to load mobile server storage".to_owned();
                 set_error(&context, &message);
                 send_done(done_tx, Err(message));
+                clear_startup_failure(&context);
                 return Err(error);
             }
 
@@ -160,6 +161,7 @@ impl MobileServer {
                     let message = "failed to load mobile host identity".to_owned();
                     set_error(&context, &message);
                     send_done(done_tx, Err(message));
+                    clear_startup_failure(&context);
                     return Err(error);
                 }
             };
@@ -170,6 +172,7 @@ impl MobileServer {
                     let message = "failed to load mobile server grants".to_owned();
                     set_error(&context, &message);
                     send_done(done_tx, Err(message));
+                    clear_startup_failure(&context);
                     return Err(error);
                 }
             };
@@ -180,6 +183,7 @@ impl MobileServer {
                 let message = "failed to persist mobile server binding".to_owned();
                 set_error(&context, &message);
                 send_done(done_tx, Err(message));
+                clear_startup_failure(&context);
                 return Err(error);
             }
 
@@ -203,6 +207,7 @@ impl MobileServer {
             if let Err(error) = worker {
                 let message = "failed to start mobile server listener".to_owned();
                 set_error(&context, &message);
+                clear_startup_failure(&context);
                 return Err(anyhow!(error).context(message));
             }
 
@@ -232,6 +237,7 @@ impl MobileServer {
                 }
                 Err(message) => {
                     set_error(&context, &message);
+                    clear_startup_failure(&context);
                     Err(anyhow!(message))
                 }
             }
@@ -322,15 +328,9 @@ impl MobileServer {
         let store = self.store.clone();
         let context = self.context.clone();
         cx.spawn(async move |async_cx| {
-            let changed = store.revoke_grant(id, OffsetDateTime::now_utc()).await?;
+            let at = OffsetDateTime::now_utc();
+            let changed = revoke_grant_and_close(&store, &context, id, at).await?;
             if changed {
-                let at = store
-                    .grant(id)
-                    .await?
-                    .and_then(|grant| grant.revoked_at)
-                    .unwrap_or_else(OffsetDateTime::now_utc);
-                close_connections_for_grant(&context, id);
-                emit_grant_update(&context, GrantUpdate::Revoke { id, at });
                 async_cx.update(|app| {
                     if app.has_global::<MobileServer>() {
                         app.update_global::<MobileServer, _>(|server, _| {
@@ -357,6 +357,20 @@ impl Drop for MobileServer {
         }
         close_all_connections(&self.context);
     }
+}
+
+async fn revoke_grant_and_close(
+    store: &Arc<MobileStore>,
+    context: &ServerContext,
+    id: Uuid,
+    at: OffsetDateTime,
+) -> Result<bool> {
+    let changed = store.revoke_grant(id, at).await?;
+    if changed {
+        close_connections_for_grant(context, id);
+        emit_grant_update(context, GrantUpdate::Revoke { id, at });
+    }
+    Ok(changed)
 }
 
 pub fn tailscale_addresses() -> Result<Vec<IpAddr>> {
@@ -548,6 +562,26 @@ fn clear_runtime(context: &ServerContext) {
     state.expired_offers.clear();
     state.active_connections.clear();
     state.status = MobileServerStatus::Disabled;
+}
+
+fn clear_startup_failure(context: &ServerContext) {
+    let shutdown_tx = {
+        let mut state = lock_state(context);
+        state.done_rx = None;
+        state.host_signing_key = None;
+        state.endpoint = None;
+        state.offers.clear();
+        state.consumed_offers.clear();
+        state.expired_offers.clear();
+        state.shutdown_tx.take()
+    };
+    if let Some(shutdown_tx) = shutdown_tx {
+        match shutdown_tx.send(()) {
+            Ok(()) => {}
+            Err(()) => {}
+        }
+    }
+    close_all_connections(context);
 }
 
 fn send_done(
@@ -1576,6 +1610,132 @@ async fn send_close(socket: &mut WebSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    async fn connect_websocket(port: u16) -> TcpStream {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("mobile listener should accept loopback connections");
+        stream
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
+                     Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                     Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("websocket handshake should be written");
+
+        let mut response = Vec::new();
+        let mut byte = [0; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .await
+                .expect("websocket handshake should complete");
+            response.push(byte[0]);
+            assert!(
+                response.len() <= 8192,
+                "websocket handshake response should be bounded"
+            );
+        }
+        let response = String::from_utf8(response).expect("handshake should be UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 101"),
+            "websocket handshake should be accepted"
+        );
+        stream
+    }
+
+    async fn send_client_frame(stream: &mut TcpStream, frame: &ClientFrame) {
+        let payload = frame.to_json().expect("client frame should serialize");
+        let payload = payload.as_bytes();
+        assert!(payload.len() <= MAX_WEBSOCKET_FRAME_BYTES);
+        let mut encoded = Vec::with_capacity(payload.len() + 14);
+        encoded.push(0x81);
+        match payload.len() {
+            length @ 0..=125 => encoded.push(0x80 | length as u8),
+            length @ 126..=65535 => {
+                encoded.push(0x80 | 126);
+                encoded.extend_from_slice(&(length as u16).to_be_bytes());
+            }
+            length => {
+                encoded.push(0x80 | 127);
+                encoded.extend_from_slice(&(length as u64).to_be_bytes());
+            }
+        }
+        let mask = [9, 8, 7, 6];
+        encoded.extend_from_slice(&mask);
+        encoded.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        stream
+            .write_all(&encoded)
+            .await
+            .expect("client websocket frame should be written");
+    }
+
+    async fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
+        let (opcode, payload) = read_websocket_frame(stream).await;
+        assert_eq!(opcode, 1, "server should send protocol frames as text");
+        ServerFrame::from_json(
+            std::str::from_utf8(&payload).expect("server frame should be UTF-8"),
+        )
+        .expect("server frame should decode")
+    }
+
+    async fn read_websocket_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        let mut header = [0; 2];
+        stream
+            .read_exact(&mut header)
+            .await
+            .expect("websocket frame header should be readable");
+        let opcode = header[0] & 0x0f;
+        let masked = header[1] & 0x80 != 0;
+        let mut length = (header[1] & 0x7f) as u64;
+        if length == 126 {
+            let mut bytes = [0; 2];
+            stream
+                .read_exact(&mut bytes)
+                .await
+                .expect("websocket extended length should be readable");
+            length = u16::from_be_bytes(bytes) as u64;
+        } else if length == 127 {
+            let mut bytes = [0; 8];
+            stream
+                .read_exact(&mut bytes)
+                .await
+                .expect("websocket extended length should be readable");
+            length = u64::from_be_bytes(bytes);
+        }
+        assert!(length <= MAX_WEBSOCKET_FRAME_BYTES as u64);
+        let mut mask = [0; 4];
+        if masked {
+            stream
+                .read_exact(&mut mask)
+                .await
+                .expect("websocket mask should be readable");
+        }
+        let mut payload = vec![0; length as usize];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("websocket frame payload should be readable");
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % mask.len()];
+            }
+        }
+        (opcode, payload)
+    }
 
     #[test]
     fn rejects_non_tailscale_bindings() {
@@ -1629,6 +1789,81 @@ mod tests {
         assert!(svg.contains("path"));
     }
 
+
+    #[gpui::test]
+    async fn startup_failure_releases_lifecycle_state(cx: &gpui::TestAppContext) {
+        use std::{future::Future, pin::Pin};
+
+        use credentials_provider::CredentialsProvider;
+
+        struct FailingCredentials;
+
+        impl CredentialsProvider for FailingCredentials {
+            fn read_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+                Box::pin(async {
+                    Ok(Some(("invalid".to_owned(), Vec::new())))
+                })
+            }
+
+            fn write_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _username: &'a str,
+                _password: &'a [u8],
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn delete_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let database = db::kvp::KeyValueStore::open_test_db("mobile_server_startup_failure").await;
+        let store = MobileStore::new(database, Arc::new(FailingCredentials));
+        cx.update(|app| MobileServer::init(store, "Zed Desktop".into(), app));
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("an ephemeral test port should be available")
+            .local_addr()
+            .expect("test listener should have a local address")
+            .port();
+        let binding = MobileBinding {
+            enabled: true,
+            address: "127.0.0.1".parse().expect("loopback address should parse"),
+            port: NonZeroU16::new(port).expect("ephemeral port should be nonzero"),
+        };
+
+        let first = cx.update(|app| {
+            app.update_global::<MobileServer, _>(|server, app| {
+                server.enable(binding.clone(), app)
+            })
+        });
+        let first_error = first.await.expect_err("corrupt host identity should fail startup");
+        assert!(first_error.to_string().contains("mobile host"));
+        assert!(matches!(
+            cx.update(|app| app.global::<MobileServer>().status()),
+            MobileServerStatus::Error { .. }
+        ));
+
+        let second = cx.update(|app| {
+            app.update_global::<MobileServer, _>(|server, app| {
+                server.enable(binding, app)
+            })
+        });
+        let second_error = second
+            .await
+            .expect_err("retry should report the storage error again");
+        assert!(!second_error.to_string().contains("already enabled"));
+    }
     #[gpui::test]
     async fn pairing_challenge_is_pinned_and_offer_is_one_use(cx: &gpui::TestAppContext) {
         use std::{future::Future, pin::Pin};
@@ -1845,5 +2080,373 @@ mod tests {
             .expect_err("expired offers must be rejected");
         assert_eq!(expired.code, "offer_expired");
         let _ = cx;
+    }
+
+    #[test]
+    fn websocket_pair_connect_status_and_revoke() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime should build")
+            .block_on(async {
+        use std::{future::Future, pin::Pin};
+
+        use credentials_provider::CredentialsProvider;
+
+        struct EmptyCredentials;
+
+        impl CredentialsProvider for EmptyCredentials {
+            fn read_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn write_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _username: &'a str,
+                _password: &'a [u8],
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn delete_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let database = db::kvp::KeyValueStore::open_test_db("mobile_server_websocket_flow").await;
+        let store = Arc::new(MobileStore::new(
+            database,
+            Arc::new(EmptyCredentials),
+        ));
+        let (grant_updates, _grant_updates_rx) = futures::channel::mpsc::unbounded();
+        let context = Arc::new(ServerContext::new(
+            "Zed Desktop".to_owned(),
+            store.clone(),
+            grant_updates,
+        ));
+        let host_signing_key = SigningKey::from_bytes(&[3; 32]);
+        let client_signing_key = SigningKey::from_bytes(&[7; 32]);
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("an ephemeral test port should be available")
+            .local_addr()
+            .expect("test listener should have a local address")
+            .port();
+        let binding = MobileBinding {
+            enabled: true,
+            address: "127.0.0.1".parse().expect("loopback address should parse"),
+            port: NonZeroU16::new(port).expect("ephemeral port should be nonzero"),
+        };
+        let endpoint = endpoint_for(binding.address, binding.port);
+        let now = OffsetDateTime::now_utc();
+        let offer_id = Uuid::from_u128(10);
+        let pairing_secret = random_base64_token();
+        let pairing_digest = Sha256::digest(pairing_secret.as_bytes());
+        let mut pairing_digest_bytes = [0; 32];
+        pairing_digest_bytes.copy_from_slice(&pairing_digest);
+        let offer = PairingOffer {
+            offer_id,
+            endpoint: endpoint.clone(),
+            protocol_version: MOBILE_PROTOCOL_VERSION,
+            host_public_key: URL_SAFE_NO_PAD.encode(host_signing_key.verifying_key().to_bytes()),
+            pairing_secret: pairing_secret.clone(),
+            expires_at: now + OFFER_LIFETIME,
+        };
+        {
+            let mut state = lock_state(&context);
+            state.host_signing_key = Some(Arc::new(host_signing_key.clone()));
+            state.endpoint = Some(endpoint);
+            state.status = MobileServerStatus::Listening {
+                endpoint: format!("ws://127.0.0.1:{port}"),
+                connected_devices: 0,
+            };
+            state.offers.insert(
+                offer_id,
+                StoredOffer {
+                    offer: offer.clone(),
+                    secret_digest: pairing_digest_bytes,
+                },
+            );
+        }
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let listener_context = context.clone();
+        let listener_thread = thread::Builder::new()
+            .name("zed-mobile-server-test".to_owned())
+            .spawn(move || {
+                run_listener_thread(
+                    listener_context,
+                    binding,
+                    ready_tx,
+                    done_tx,
+                    shutdown_rx,
+                );
+            })
+            .expect("mobile listener test thread should start");
+        assert_eq!(
+            ready_rx.await.expect("listener should report readiness"),
+            Ok(())
+        );
+
+        let host_public_key = VerifyingKey::from_bytes(&array_32(
+            &decode_fixed(&offer.host_public_key, 32).expect("host key should decode"),
+        ))
+        .expect("host key should be valid");
+        let mut pairing_socket = connect_websocket(port).await;
+        let client_nonce = random_base64_token();
+        send_client_frame(
+            &mut pairing_socket,
+            &ClientFrame::PairBegin {
+                offer_id,
+                client_nonce: client_nonce.clone(),
+            },
+        )
+        .await;
+        let challenge = read_server_frame(&mut pairing_socket).await;
+        let challenge_json = challenge.to_json().expect("challenge should serialize");
+        assert!(
+            !challenge_json.contains(&pairing_secret),
+            "pairing secret must not be sent in the challenge"
+        );
+        let ServerFrame::PairChallenge {
+            offer_id: challenged_offer_id,
+            client_nonce: challenged_client_nonce,
+            server_nonce,
+            host_signature,
+        } = challenge
+        else {
+            panic!("expected a pairing challenge");
+        };
+        let challenge_payload = pairing_payload(
+            MOBILE_PROTOCOL_VERSION,
+            challenged_offer_id,
+            &challenged_client_nonce,
+            &server_nonce,
+        )
+        .expect("pairing payload should encode");
+        host_public_key
+            .verify(
+                &challenge_payload,
+                &Signature::from_slice(
+                    &decode_fixed(&host_signature, 64).expect("host signature should decode"),
+                )
+                .expect("host signature should be valid"),
+            )
+            .expect("host signature should verify before sending the pairing secret");
+        let client_proof = client_signing_key.sign(&challenge_payload);
+        send_client_frame(
+            &mut pairing_socket,
+            &ClientFrame::PairComplete {
+                offer_id,
+                pairing_secret,
+                client_public_key: URL_SAFE_NO_PAD.encode(client_signing_key.verifying_key().to_bytes()),
+                client_proof: URL_SAFE_NO_PAD.encode(client_proof.to_bytes()),
+                device_label: "Integration phone".to_owned(),
+            },
+        )
+        .await;
+        let (grant_id, token) = match read_server_frame(&mut pairing_socket).await {
+            ServerFrame::PairComplete { grant_id, token } => {
+                assert!(!token.is_empty(), "pairing should return a one-time token");
+                (grant_id, token)
+            }
+            frame => panic!("expected pair completion, got {frame:?}"),
+        };
+        assert_eq!(
+            read_server_frame(&mut pairing_socket).await,
+            ServerFrame::Authenticated { grant_id }
+        );
+        drop(pairing_socket);
+
+        let mut consumed_socket = connect_websocket(port).await;
+        send_client_frame(
+            &mut consumed_socket,
+            &ClientFrame::PairBegin {
+                offer_id,
+                client_nonce: random_base64_token(),
+            },
+        )
+        .await;
+        match read_server_frame(&mut consumed_socket).await {
+            ServerFrame::Error { code, .. } => assert_eq!(code, "offer_consumed"),
+            frame => panic!("expected consumed-offer error, got {frame:?}"),
+        }
+        drop(consumed_socket);
+
+        let expired_id = Uuid::from_u128(11);
+        let expired_secret = random_base64_token();
+        let expired_digest = Sha256::digest(expired_secret.as_bytes());
+        let mut expired_digest_bytes = [0; 32];
+        expired_digest_bytes.copy_from_slice(&expired_digest);
+        {
+            let mut state = lock_state(&context);
+            state.offers.insert(
+                expired_id,
+                StoredOffer {
+                    offer: PairingOffer {
+                        offer_id: expired_id,
+                        endpoint: format!("ws://127.0.0.1:{port}"),
+                        protocol_version: MOBILE_PROTOCOL_VERSION,
+                        host_public_key: URL_SAFE_NO_PAD.encode(host_signing_key.verifying_key().to_bytes()),
+                        pairing_secret: expired_secret,
+                        expires_at: now - Duration::seconds(1),
+                    },
+                    secret_digest: expired_digest_bytes,
+                },
+            );
+        }
+        let mut expired_socket = connect_websocket(port).await;
+        send_client_frame(
+            &mut expired_socket,
+            &ClientFrame::PairBegin {
+                offer_id: expired_id,
+                client_nonce: random_base64_token(),
+            },
+        )
+        .await;
+        match read_server_frame(&mut expired_socket).await {
+            ServerFrame::Error { code, .. } => assert_eq!(code, "offer_expired"),
+            frame => panic!("expected expired-offer error, got {frame:?}"),
+        }
+        drop(expired_socket);
+
+        let persisted_grant = store
+            .grant(grant_id)
+            .await
+            .expect("grant should be readable")
+            .expect("pairing should persist a grant");
+        let mut authentication_socket = connect_websocket(port).await;
+        let authentication_nonce = random_base64_token();
+        send_client_frame(
+            &mut authentication_socket,
+            &ClientFrame::Connect {
+                grant_id,
+                client_nonce: authentication_nonce,
+            },
+        )
+        .await;
+        let challenge = read_server_frame(&mut authentication_socket).await;
+        let challenge_json = challenge.to_json().expect("challenge should serialize");
+        assert!(
+            !challenge_json.contains(&token),
+            "authentication token must not be sent in the challenge"
+        );
+        let ServerFrame::ServerChallenge {
+            grant_id: challenged_grant_id,
+            client_nonce: challenged_client_nonce,
+            server_nonce,
+            host_signature,
+        } = challenge
+        else {
+            panic!("expected an authentication challenge");
+        };
+        let token_digest = decode_digest(&persisted_grant.token_digest)
+            .expect("persisted token digest should decode");
+        let authentication_payload = authentication_payload(
+            MOBILE_PROTOCOL_VERSION,
+            challenged_grant_id,
+            &challenged_client_nonce,
+            &server_nonce,
+            &token_digest,
+        )
+        .expect("authentication payload should encode");
+        host_public_key
+            .verify(
+                &authentication_payload,
+                &Signature::from_slice(
+                    &decode_fixed(&host_signature, 64).expect("host signature should decode"),
+                )
+                .expect("host signature should be valid"),
+            )
+            .expect("host signature should verify before sending the token");
+        let authentication_proof = client_signing_key.sign(&authentication_payload);
+        send_client_frame(
+            &mut authentication_socket,
+            &ClientFrame::Authenticate {
+                grant_id,
+                token,
+                client_proof: URL_SAFE_NO_PAD.encode(authentication_proof.to_bytes()),
+            },
+        )
+        .await;
+        assert_eq!(
+            read_server_frame(&mut authentication_socket).await,
+            ServerFrame::Authenticated { grant_id }
+        );
+
+        let request_id = Uuid::from_u128(12);
+        send_client_frame(
+            &mut authentication_socket,
+            &ClientFrame::Request {
+                request_id,
+                operation_id: None,
+                method: "status.get".to_owned(),
+                params: serde_json::json!({}),
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            request_id: response_id,
+            result,
+            ..
+        } = read_server_frame(&mut authentication_socket).await
+        else {
+            panic!("expected a status response");
+        };
+        assert_eq!(response_id, request_id);
+        let status: Status = serde_json::from_value(result).expect("status response should decode");
+        assert_eq!(status.host_name, "Zed Desktop");
+        assert_eq!(status.protocol_version, MOBILE_PROTOCOL_VERSION);
+        assert_eq!(status.minimum_compatible_mobile_version, MIN_COMPATIBLE_MOBILE_VERSION);
+        assert_eq!(status.capabilities, vec![Capability::StatusRead]);
+
+        assert!(
+            revoke_grant_and_close(
+                &store,
+                &context,
+                grant_id,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .expect("grant revoke should complete"),
+            "active grant should revoke once"
+        );
+        let mut byte = [0; 1];
+        let bytes_read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            authentication_socket.read(&mut byte),
+        )
+        .await
+        .expect("revocation should close the authenticated socket")
+        .expect("socket close should be readable");
+        assert_eq!(bytes_read, 0, "revocation should close the socket");
+
+        match shutdown_tx.send(()) {
+            Ok(()) => {}
+            Err(()) => {}
+        }
+        let listener_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            done_rx,
+        )
+        .await
+        .expect("listener should stop after cancellation")
+        .expect("listener should report completion");
+        assert!(listener_result.is_ok(), "listener should stop cleanly");
+        listener_thread
+            .join()
+            .expect("listener thread should exit cleanly");
+            });
     }
 }
