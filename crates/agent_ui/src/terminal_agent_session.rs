@@ -13,9 +13,7 @@ use util::paths::home_dir;
 
 use crate::{
     TerminalId,
-    terminal_thread_metadata_store::{
-        TerminalAgentSession, TerminalThreadMetadataStore,
-    },
+    terminal_thread_metadata_store::{TerminalAgentSession, TerminalThreadMetadataStore},
 };
 
 const EVENT_DIRECTORY: &str = "terminal-agent-sessions";
@@ -58,7 +56,9 @@ export default function (pi: { on: Function }) {
 
 pub(crate) struct TerminalAgentSessionCapture {
     pub(crate) environment: HashMap<String, String>,
+    #[cfg(test)]
     event_path: PathBuf,
+    #[cfg(test)]
     token: String,
 }
 
@@ -100,21 +100,17 @@ pub(crate) fn init(fs: Arc<dyn Fs>, cx: &mut App) {
             // The watch starts after creating the directory so native watchers can register it.
             // Failures are intentionally ignored: reporting must never affect an OMP turn.
             let _ = fs.create_dir(&event_directory).await;
-            let (mut events, _watcher) = fs
-                .watch(&event_directory, Duration::from_millis(100))
-                .await;
+            let (mut events, _watcher) =
+                fs.watch(&event_directory, Duration::from_millis(100)).await;
 
             while let Some(events) = events.next().await {
                 for event in events {
                     let event_path = event.path;
-                    let registered = cx
-                        .update(|cx| {
-                            TerminalAgentSessionReporter::update_global(
-                                cx,
-                                |reporter, _cx| reporter.is_registered_event_path(&event_path),
-                            )
+                    let registered = cx.update(|cx| {
+                        TerminalAgentSessionReporter::update_global(cx, |reporter, _cx| {
+                            reporter.is_registered_event_path(&event_path)
                         })
-                        .unwrap_or(false);
+                    });
                     if !registered {
                         continue;
                     }
@@ -131,8 +127,7 @@ pub(crate) fn init(fs: Arc<dyn Fs>, cx: &mut App) {
                     if bytes.len() > MAX_EVENT_FILE_SIZE {
                         continue;
                     }
-                    let Ok(report) =
-                        serde_json::from_slice::<TerminalAgentSessionReport>(&bytes)
+                    let Ok(report) = serde_json::from_slice::<TerminalAgentSessionReport>(&bytes)
                     else {
                         continue;
                     };
@@ -157,7 +152,6 @@ pub(crate) fn init(fs: Arc<dyn Fs>, cx: &mut App) {
 
 impl TerminalAgentSessionReporter {
     pub(crate) fn prepare_omp_extension(&mut self, cx: &mut App) -> Task<Result<()>> {
-
         let fs = self.fs.clone();
         let extension_directory = home_dir().join(".omp/agent/extensions");
         let extension_path = extension_directory.join(OMP_EXTENSION_FILE_NAME);
@@ -172,15 +166,14 @@ impl TerminalAgentSessionReporter {
 
             // Reserve the path without replacing a file that may have appeared since metadata
             // was read. Only the reserved file is populated with the managed extension.
-            match fs.create_file(&extension_path, CreateOptions::default()).await {
+            match fs
+                .create_file(&extension_path, CreateOptions::default())
+                .await
+            {
                 Ok(()) => {}
                 Err(error) => {
-                    return handle_extension_creation_error(
-                        fs.as_ref(),
-                        &extension_path,
-                        error,
-                    )
-                    .await;
+                    return handle_extension_creation_error(fs.as_ref(), &extension_path, error)
+                        .await;
                 }
             }
             if let Err(error) = fs.write(&extension_path, OMP_EXTENSION.as_bytes()).await {
@@ -271,22 +264,22 @@ impl TerminalAgentSessionReporter {
         );
 
         TerminalAgentSessionCapture {
-            environment: HashMap::from([
-                (
-                    "ZED_TERMINAL_THREAD_ID".to_string(),
-                    terminal_id_string,
-                ),
+            environment: [
+                ("ZED_TERMINAL_THREAD_ID".to_string(), terminal_id_string),
                 (
                     "ZED_AGENT_SESSION_EVENT_PATH".to_string(),
                     event_path.display().to_string(),
                 ),
                 ("ZED_AGENT_SESSION_TOKEN".to_string(), token.clone()),
-            ]),
+            ]
+            .into_iter()
+            .collect(),
+            #[cfg(test)]
             event_path,
+            #[cfg(test)]
             token,
         }
     }
-
 
     pub(crate) fn unregister_capture(&mut self, terminal_id: TerminalId, cx: &mut App) {
         let Some(capture) = self.captures.remove(&terminal_id) else {
@@ -412,15 +405,14 @@ mod tests {
     use chrono::Utc;
     use fs::{FakeFs, Fs};
     use gpui::TestAppContext;
-    use gpui::UpdateGlobal as _;
     use std::path::PathBuf;
     use workspace::PathList;
 
+    use crate::TerminalId;
     use crate::terminal_thread_metadata_store::{
         TerminalAgentSession, TerminalThreadMetadata, TerminalThreadMetadataStore,
     };
     use crate::thread_metadata_store::WorktreePaths;
-    use crate::TerminalId;
 
     fn init_test(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
@@ -433,9 +425,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_prepare_omp_extension_materializes_on_prepare_request(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_prepare_omp_extension_materializes_on_prepare_request(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
             <dyn Fs>::set_global(fs.clone(), cx);
@@ -462,9 +452,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_existing_managed_omp_extension_wins_creation_race(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_existing_managed_omp_extension_wins_creation_race(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         let extension_path = util::paths::home_dir()
             .join(".omp/agent/extensions")
@@ -475,9 +463,8 @@ mod tests {
         fs.insert_file(&extension_path, OMP_EXTENSION.as_bytes().to_vec())
             .await;
 
-        let already_exists = anyhow::Error::new(std::io::Error::from(
-            std::io::ErrorKind::AlreadyExists,
-        ));
+        let already_exists =
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
         handle_extension_creation_error(fs.as_ref(), &extension_path, already_exists)
             .await
             .expect("an already-written managed extension should win the creation race");
@@ -529,7 +516,7 @@ mod tests {
         let capture = register_capture(cx, terminal_id);
         assert_eq!(
             capture.environment,
-            HashMap::from([
+            [
                 (
                     "ZED_TERMINAL_THREAD_ID".to_string(),
                     terminal_id.to_key_string(),
@@ -538,11 +525,10 @@ mod tests {
                     "ZED_AGENT_SESSION_EVENT_PATH".to_string(),
                     capture.event_path.display().to_string(),
                 ),
-                (
-                    "ZED_AGENT_SESSION_TOKEN".to_string(),
-                    capture.token.clone(),
-                ),
-            ])
+                ("ZED_AGENT_SESSION_TOKEN".to_string(), capture.token.clone(),),
+            ]
+            .into_iter()
+            .collect::<HashMap<_, _>>()
         );
 
         cx.update(|cx| {

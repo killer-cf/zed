@@ -763,7 +763,6 @@ mod tests {
         assert!(!environment.contains_key("ZED_AGENT_SESSION_TOKEN"));
     }
 
-
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {
             command: Some("cmd.exe".to_string()),

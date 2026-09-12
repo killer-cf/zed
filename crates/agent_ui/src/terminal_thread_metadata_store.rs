@@ -663,8 +663,7 @@ impl Column for TerminalThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (agent_id, next): (Option<String>, i32) = Column::column(statement, next)?;
-        let (agent_resume_target, next): (Option<String>, i32) =
-            Column::column(statement, next)?;
+        let (agent_resume_target, next): (Option<String>, i32) = Column::column(statement, next)?;
         let (agent_working_directory, next): (Option<String>, i32) =
             Column::column(statement, next)?;
 

@@ -39,11 +39,10 @@ use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
-use crate::terminal_agent_session::{resume_command, TerminalAgentSessionReporter};
+use crate::terminal_agent_session::{TerminalAgentSessionReporter, resume_command};
 use crate::terminal_thread_metadata_store::{
     TerminalAgentSession, TerminalThreadMetadata, TerminalThreadMetadataStore,
-    compose_terminal_thread_title,
-    normalize_terminal_custom_title, terminal_title_without_prefix,
+    compose_terminal_thread_title, normalize_terminal_custom_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -2080,14 +2079,16 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, agent_session.as_ref(), cx);
+        let init_command =
+            Self::terminal_init_command(run_init_command, agent_session.as_ref(), cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
         let project = self.project.clone();
 
         cx.spawn_in(window, async move |this, cx| {
-            let is_local =
-                project.read_with(cx, |project, cx| project.remote_connection_options(cx).is_none());
+            let is_local = project.read_with(cx, |project, cx| {
+                project.remote_connection_options(cx).is_none()
+            });
             let (terminal_task, capture_registered) = if is_local && !restored {
                 let prepare = cx.update(|_, cx| {
                     TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
@@ -2097,10 +2098,9 @@ impl AgentPanel {
                 match prepare.await {
                     Ok(()) => {
                         let capture = cx.update(|_, cx| {
-                            TerminalAgentSessionReporter::update_global(
-                                cx,
-                                |reporter, _cx| reporter.register_capture(terminal_id),
-                            )
+                            TerminalAgentSessionReporter::update_global(cx, |reporter, _cx| {
+                                reporter.register_capture(terminal_id)
+                            })
                         })?;
                         let terminal_task = project.update(cx, |project, cx| {
                             project.create_terminal_shell_with_environment(
@@ -2112,24 +2112,20 @@ impl AgentPanel {
                         (terminal_task, true)
                     }
                     Err(error) => {
-                        log::error!(
-                            "failed to prepare OMP terminal session extension: {error:#}"
-                        );
+                        log::error!("failed to prepare OMP terminal session extension: {error:#}");
                         workspace
                             .update(cx, |workspace, cx| workspace.show_error(error, cx))
                             .log_err();
-                        let terminal_task = project
-                            .update(cx, |project, cx| {
-                                project.create_terminal_shell(working_directory, cx)
-                            });
+                        let terminal_task = project.update(cx, |project, cx| {
+                            project.create_terminal_shell(working_directory, cx)
+                        });
                         (terminal_task, false)
                     }
                 }
             } else {
-                let terminal_task =
-                    project.update(cx, |project, cx| {
-                        project.create_terminal_shell(working_directory, cx)
-                    });
+                let terminal_task = project.update(cx, |project, cx| {
+                    project.create_terminal_shell(working_directory, cx)
+                });
                 (terminal_task, false)
             };
 
@@ -7785,9 +7781,9 @@ mod tests {
             title: "OMP one".into(),
             custom_title: None,
             created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
-                PathBuf::from("/worktree"),
-            ])),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
             remote_connection: None,
             working_directory: Some(PathBuf::from("/last-shell-cwd")),
             agent_session: Some(TerminalAgentSession {
@@ -7801,9 +7797,9 @@ mod tests {
             title: "OMP two".into(),
             custom_title: None,
             created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
-                PathBuf::from("/worktree"),
-            ])),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
             remote_connection: None,
             working_directory: Some(PathBuf::from("/second-last-shell-cwd")),
             agent_session: Some(TerminalAgentSession {
@@ -7838,15 +7834,18 @@ mod tests {
                 .clone()
         });
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(input_log, vec![b"omp --resume 'omp-session-one'\r".to_vec()]);
+        assert_eq!(
+            input_log,
+            vec![b"omp --resume 'omp-session-one'\r".to_vec()]
+        );
         assert_eq!(
             panel.read_with(&cx, |panel, _| {
                 panel
                     .terminals
                     .get(&terminal_id)
-                    .and_then(|terminal| terminal.working_directory.as_deref())
+                    .and_then(|terminal| terminal.working_directory.clone())
             }),
-            Some(Path::new("/agent-session-cwd"))
+            Some(PathBuf::from("/agent-session-cwd"))
         );
 
         panel
@@ -7890,9 +7889,9 @@ mod tests {
             title: "Generic restored terminal".into(),
             custom_title: None,
             created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
-                PathBuf::from("/worktree"),
-            ])),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
             remote_connection: None,
             working_directory: Some(PathBuf::from("/last-shell-cwd")),
             agent_session: None,
@@ -7942,9 +7941,9 @@ mod tests {
             title: "Invalid restored terminal".into(),
             custom_title: None,
             created_at: Utc::now(),
-            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[
-                PathBuf::from("/worktree"),
-            ])),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
             remote_connection: None,
             working_directory: Some(PathBuf::from("/last-shell-cwd")),
             agent_session: Some(TerminalAgentSession {
@@ -8129,15 +8128,16 @@ mod tests {
             {
                 break;
             }
-            assert!(Instant::now() < deadline, "capture environment was not inherited");
+            assert!(
+                Instant::now() < deadline,
+                "capture environment was not inherited"
+            );
             cx.executor().timer(Duration::from_millis(50)).await;
         }
     }
 
     #[gpui::test]
-    async fn test_terminal_metadata_save_preserves_reported_agent_session(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_terminal_metadata_save_preserves_reported_agent_session(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
         let terminal_id = panel
@@ -8184,7 +8184,6 @@ mod tests {
             );
         });
     }
-
 
     #[gpui::test]
     async fn test_restored_terminal_does_not_update_global_entry_kind(cx: &mut TestAppContext) {
