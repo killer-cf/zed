@@ -1,9 +1,9 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
 
 use anyhow::{Result, anyhow, ensure};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Subscription, Task, TaskExt, Window, WindowOptions,
-    actions, div, prelude::*, px, svg,
+    App, AppContext, ClipboardItem, Context, RenderImage, Subscription, Task, TaskExt, Window,
+    WindowOptions, actions, div, img, prelude::*, px,
 };
 use mobile_protocol::PairingOffer;
 use time::OffsetDateTime;
@@ -30,6 +30,14 @@ pub struct PairingDisplay {
     pub expires_at: OffsetDateTime,
 }
 
+const QR_RENDER_SCALE: f32 = 8.0;
+
+fn rasterize_pairing_svg(qr_svg: &str, cx: &App) -> Result<Arc<RenderImage>> {
+    cx.svg_renderer()
+        .render_single_frame(qr_svg.as_bytes(), QR_RENDER_SCALE)
+        .map_err(|error| anyhow!(error))
+}
+
 /// State owned by the Mobile control surface.
 ///
 /// This model deliberately stores only addresses returned by [`tailscale_addresses`]. A binding is
@@ -41,6 +49,7 @@ pub struct MobileControlModel {
     port: u16,
     pairing_offer: Option<PairingOffer>,
     pairing_display: Option<PairingDisplay>,
+    pairing_qr_image: Option<Arc<RenderImage>>,
     discovery_error: Option<String>,
     error: Option<String>,
 }
@@ -53,6 +62,7 @@ impl Default for MobileControlModel {
             port: DEFAULT_PORT,
             pairing_offer: None,
             pairing_display: None,
+            pairing_qr_image: None,
             discovery_error: None,
             error: None,
         }
@@ -256,11 +266,15 @@ impl MobileControlWindow {
         });
         match offer {
             Ok(offer) => match MobileControlModel::pairing_display(&offer) {
-                Ok(display) => {
-                    self.model.pairing_offer = Some(offer);
-                    self.model.pairing_display = Some(display);
-                    self.model.clear_error();
-                }
+                Ok(display) => match rasterize_pairing_svg(&display.qr_svg, cx) {
+                    Ok(qr_image) => {
+                        self.model.pairing_offer = Some(offer);
+                        self.model.pairing_display = Some(display);
+                        self.model.pairing_qr_image = Some(qr_image);
+                        self.model.clear_error();
+                    }
+                    Err(error) => self.model.set_error(error.to_string()),
+                },
                 Err(error) => self.model.set_error(error.to_string()),
             },
             Err(error) => self.model.set_error(error.to_string()),
@@ -388,10 +402,10 @@ impl MobileControlWindow {
         let Some(display) = self.model.pairing_display_snapshot() else {
             return div().child("No pairing QR generated.").into_any_element();
         };
-        let qr = svg()
-            .data(display.qr_svg.as_bytes())
-            .size(px(220.))
-            .text_color(gpui::black());
+        let Some(qr_image) = self.model.pairing_qr_image.clone() else {
+            return div().child("Pairing QR is unavailable.").into_any_element();
+        };
+        let qr = img(qr_image).size(px(220.));
         div()
             .child(qr)
             .child(display.visible_text.clone())
@@ -504,7 +518,7 @@ pub fn init_mobile_window(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc};
+    use std::{collections::HashSet, future::Future, net::IpAddr, pin::Pin, sync::Arc};
 
     use anyhow::Result;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -597,6 +611,27 @@ mod tests {
         assert!(!display
             .visible_text
             .contains(&offer.encode_url().expect("pairing URL should encode")));
+    }
+
+    #[gpui::test]
+    async fn test_mobile_control_rasterizes_qr_with_distinct_module_colors(
+        cx: &mut TestAppContext,
+    ) {
+        install_server(cx, "mobile_window_qr_raster").await;
+        let display = MobileControlModel::pairing_display(&test_pairing_offer())
+            .expect("pairing display should render");
+        let image = cx
+            .read(|app| rasterize_pairing_svg(&display.qr_svg, app))
+            .expect("pairing QR should rasterize");
+        let pixels = image.as_bytes(0).expect("rasterized QR should have pixels");
+        let colors = pixels
+            .chunks_exact(4)
+            .map(|pixel| (pixel[0], pixel[1], pixel[2], pixel[3]))
+            .collect::<HashSet<_>>();
+        assert!(
+            colors.len() > 1,
+            "rasterized QR should preserve both dark modules and its light quiet zone"
+        );
     }
 
     #[gpui::test]
