@@ -140,6 +140,8 @@ members = [
     "crates/menu",
     "crates/mermaid_render",
     "crates/migrator",
+    "crates/mobile_protocol",
+    "crates/mobile_server",
     "crates/miniprofiler_ui",
     "crates/mistral",
     "crates/multi_buffer",
@@ -408,6 +410,8 @@ media = { path = "crates/media" }
 menu = { path = "crates/menu" }
 mermaid_render = { path = "crates/mermaid_render" }
 migrator = { path = "crates/migrator" }
+mobile_protocol = { path = "crates/mobile_protocol" }
+mobile_server = { path = "crates/mobile_server" }
 miniprofiler_ui = { path = "crates/miniprofiler_ui" }
 mistral = { path = "crates/mistral" }
 multi_buffer = { path = "crates/multi_buffer" }
@@ -615,6 +619,7 @@ documented = "0.10"
 dotenvy = "0.15.0"
 dunce = "1.0"
 ec4rs = { version = "1.2", features = ["allow-empty-values"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 emojis = "0.9"
 encoding_rs = "0.8"
 env_logger = "0.11"
@@ -641,6 +646,7 @@ http-body = "1.0"
 httparse = "1.10"
 human_bytes = "0.4.1"
 idna = "1.0"
+if-addrs = "0.14"
 ignore = "0.4.22"
 # image's default features minus "avif", which only adds an encoder (rav1e);
 # decoding AVIF would additionally need the non-default "avif-native" feature.
@@ -781,7 +787,9 @@ proxyvars = "0.2"
 pulldown-cmark = { version = "0.13.0", default-features = false }
 quick-xml = "0.41"
 quote = "1.0.9"
+qrcodegen = "1.8"
 rand = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 raw-window-handle = "0.6"
 rayon = "1.8"
 regex = "1.5"
@@ -836,6 +844,7 @@ sqlformat = "0.2"
 stacksafe = "1.0"
 streaming-iterator = "0.1"
 strsim = "0.11"
+subtle = "2.6"
 strum = { version = "0.28", features = ["derive"] }
 swash = "0.2.6"
 syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
