@@ -24,6 +24,7 @@ mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+mod terminal_agent_session;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
@@ -617,6 +618,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    terminal_agent_session::init(fs.clone(), cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);

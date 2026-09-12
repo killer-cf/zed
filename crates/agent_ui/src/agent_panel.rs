@@ -39,9 +39,10 @@ use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
+use crate::terminal_agent_session::{TerminalAgentSessionReporter, resume_command};
 use crate::terminal_thread_metadata_store::{
-    TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
-    normalize_terminal_custom_title, terminal_title_without_prefix,
+    TerminalAgentSession, TerminalThreadMetadata, TerminalThreadMetadataStore,
+    compose_terminal_thread_title, normalize_terminal_custom_title, terminal_title_without_prefix,
 };
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
@@ -76,8 +77,8 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
-    pulsating_between,
+    PlatformDisplay, Subscription, Task, TaskExt, UpdateGlobal as _, WeakEntity, WindowHandle,
+    prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -2015,6 +2016,8 @@ impl AgentPanel {
             true,
             true,
             true,
+            false,
+            None,
             source,
             window,
             cx,
@@ -2069,23 +2072,73 @@ impl AgentPanel {
         select: bool,
         focus: bool,
         run_init_command: bool,
+        restored: bool,
+        agent_session: Option<TerminalAgentSession>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
-        let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
-        });
+        let init_command =
+            Self::terminal_init_command(run_init_command, agent_session.as_ref(), cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
-        let project = self.project.downgrade();
+        let project = self.project.clone();
 
         cx.spawn_in(window, async move |this, cx| {
+            let is_local = project.read_with(cx, |project, cx| {
+                project.remote_connection_options(cx).is_none()
+            });
+            let (terminal_task, capture_registered) = if is_local && !restored {
+                let prepare = cx.update(|_, cx| {
+                    TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                        reporter.prepare_omp_extension(cx)
+                    })
+                })?;
+                match prepare.await {
+                    Ok(()) => {
+                        let capture = cx.update(|_, cx| {
+                            TerminalAgentSessionReporter::update_global(cx, |reporter, _cx| {
+                                reporter.register_capture(terminal_id)
+                            })
+                        })?;
+                        let terminal_task = project.update(cx, |project, cx| {
+                            project.create_terminal_shell_with_environment(
+                                working_directory,
+                                capture.environment,
+                                cx,
+                            )
+                        });
+                        (terminal_task, true)
+                    }
+                    Err(error) => {
+                        log::error!("failed to prepare OMP terminal session extension: {error:#}");
+                        workspace
+                            .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                            .log_err();
+                        let terminal_task = project.update(cx, |project, cx| {
+                            project.create_terminal_shell(working_directory, cx)
+                        });
+                        (terminal_task, false)
+                    }
+                }
+            } else {
+                let terminal_task = project.update(cx, |project, cx| {
+                    project.create_terminal_shell(working_directory, cx)
+                });
+                (terminal_task, false)
+            };
+
             let terminal = match terminal_task.await {
                 Ok(terminal) => terminal,
                 Err(error) => {
+                    if capture_registered {
+                        let _ = cx.update(|_, cx| {
+                            TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                                reporter.unregister_capture(terminal_id, cx);
+                            });
+                        });
+                    }
                     log::error!("failed to spawn agent panel terminal: {error:#}");
                     workspace
                         .update(cx, |workspace, cx| workspace.show_error(error, cx))
@@ -2103,8 +2156,14 @@ impl AgentPanel {
             this.update_in(cx, |this, window, cx| {
                 let terminal_for_init_command = terminal.clone();
                 let terminal_view = cx.new(|cx| {
-                    let mut view =
-                        TerminalView::new(terminal, workspace, workspace_id, project, window, cx);
+                    let mut view = TerminalView::new(
+                        terminal,
+                        workspace,
+                        workspace_id,
+                        project.downgrade(),
+                        window,
+                        cx,
+                    );
                     view.set_show_workspace_actions(false, cx);
                     view
                 });
@@ -2128,7 +2187,15 @@ impl AgentPanel {
         .detach_and_log_err(cx);
     }
 
-    fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
+    fn terminal_init_command(
+        run_init_command: bool,
+        agent_session: Option<&TerminalAgentSession>,
+        cx: &App,
+    ) -> Option<String> {
+        if let Some(command) = agent_session.and_then(resume_command) {
+            return Some(command);
+        }
+
         run_init_command
             .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
             .flatten()
@@ -2333,6 +2400,11 @@ impl AgentPanel {
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
+        if cx.has_global::<TerminalAgentSessionReporter>() {
+            TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                reporter.unregister_capture(terminal_id, cx);
+            });
+        }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
@@ -2422,6 +2494,12 @@ impl AgentPanel {
         cx: &App,
     ) -> Option<TerminalThreadMetadata> {
         let terminal = self.terminals.get(&terminal_id)?;
+        let agent_session = TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry(terminal_id)
+                .and_then(|metadata| metadata.agent_session.clone())
+        });
         let project = self.project.read(cx);
         Some(TerminalThreadMetadata {
             terminal_id,
@@ -2431,6 +2509,7 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            agent_session,
         })
     }
 
@@ -2453,6 +2532,7 @@ impl AgentPanel {
         }
 
         self.pending_terminal_spawn = Some(metadata.terminal_id);
+        let agent_session = metadata.agent_session.clone();
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
         self.spawn_terminal(
@@ -2464,6 +2544,8 @@ impl AgentPanel {
             true,
             focus,
             true,
+            true,
+            agent_session,
             source,
             window,
             cx,
@@ -2493,6 +2575,9 @@ impl AgentPanel {
         workspace: Option<&Workspace>,
         cx: &App,
     ) -> Option<PathBuf> {
+        if let Some(agent_session) = metadata.agent_session.as_ref() {
+            return Some(agent_session.working_directory.clone());
+        }
         if let Some(working_directory) = metadata.working_directory.clone() {
             return Some(working_directory);
         }
@@ -5186,6 +5271,8 @@ impl AgentPanel {
             true,
             false,
             true,
+            false,
+            None,
             source,
             window,
             cx,
@@ -5210,6 +5297,7 @@ impl AgentPanel {
             true,
             false,
             true,
+            None,
             source,
             window,
             cx,
@@ -6754,6 +6842,7 @@ impl AgentPanel {
             focus,
             focus,
             true,
+            None,
             AgentThreadSource::AgentPanel,
             window,
             cx,
@@ -6780,6 +6869,7 @@ impl AgentPanel {
             return Ok(());
         }
 
+        let agent_session = metadata.agent_session.clone();
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
         self.insert_display_only_terminal(
@@ -6791,12 +6881,12 @@ impl AgentPanel {
             true,
             focus,
             true,
+            agent_session,
             source,
             window,
             cx,
         )
     }
-
     #[cfg(any(test, feature = "test-support"))]
     fn insert_display_only_terminal(
         &mut self,
@@ -6808,11 +6898,13 @@ impl AgentPanel {
         select: bool,
         focus: bool,
         run_init_command: bool,
+        agent_session: Option<TerminalAgentSession>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command =
+            Self::terminal_init_command(run_init_command, agent_session.as_ref(), cx);
         let settings = TerminalSettings::get_global(cx).clone();
         let path_style = self.project.read(cx).path_style(cx);
         let builder = terminal::TerminalBuilder::new_display_only(
@@ -6906,7 +6998,7 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn install_custom_agent(id: &str, cx: &mut App) {
         SettingsStore::update_global(cx, |store, cx| {
@@ -7609,6 +7701,7 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7679,20 +7772,41 @@ mod tests {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             let mut settings = AgentSettings::get_global(cx).clone();
-            settings.terminal_init_command = Some(" claude --resume ".to_string());
+            settings.terminal_init_command = Some("printf 'global-init\\n'".to_string());
             AgentSettings::override_global(settings, cx);
         });
 
         let metadata = TerminalThreadMetadata {
             terminal_id: TerminalId::new(),
-            title: "Restored Terminal".into(),
+            title: "OMP one".into(),
             custom_title: None,
             created_at: Utc::now(),
             worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
-                "/project",
+                "/worktree",
             )])),
             remote_connection: None,
-            working_directory: None,
+            working_directory: Some(PathBuf::from("/last-shell-cwd")),
+            agent_session: Some(TerminalAgentSession {
+                agent_id: "omp".to_string(),
+                resume_target: "omp-session-one".to_string(),
+                working_directory: PathBuf::from("/agent-session-cwd"),
+            }),
+        };
+        let second = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "OMP two".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
+            remote_connection: None,
+            working_directory: Some(PathBuf::from("/second-last-shell-cwd")),
+            agent_session: Some(TerminalAgentSession {
+                agent_id: "omp".to_string(),
+                resume_target: "omp-session-two".to_string(),
+                working_directory: PathBuf::from("/second-agent-session-cwd"),
+            }),
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7720,12 +7834,18 @@ mod tests {
                 .clone()
         });
         let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
-        assert_eq!(input_log, vec![b" claude --resume \r".to_vec()]);
-        assert!(
-            !terminal.read_with(&cx, |terminal, _| terminal.keyboard_input_sent()),
-            "writing the init command must not mark the terminal as having received \
-             user keyboard input, otherwise a shell that fails to spawn would be \
-             auto-closed before the user can see the error"
+        assert_eq!(
+            input_log,
+            vec![b"omp --resume 'omp-session-one'\r".to_vec()]
+        );
+        assert_eq!(
+            panel.read_with(&cx, |panel, _| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.working_directory.clone())
+            }),
+            Some(PathBuf::from("/agent-session-cwd"))
         );
 
         panel
@@ -7746,6 +7866,124 @@ mod tests {
         assert!(
             input_log.is_empty(),
             "activating an already-restored terminal should not re-run the init command, got {input_log:?}"
+        );
+        assert!(
+            !panel.read_with(&cx, |panel, _| panel.has_terminal(second.terminal_id)),
+            "restoring one persisted terminal must not spawn another terminal"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restored_terminal_without_agent_session_runs_global_init_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = Some("printf 'global-init\\n'".to_string());
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let metadata = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "Generic restored terminal".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
+            remote_connection: None,
+            working_directory: Some(PathBuf::from("/last-shell-cwd")),
+            agent_session: None,
+        };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("test terminal should be restored");
+        cx.run_until_parked();
+
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(input_log, vec![b"printf 'global-init\\n'\r".to_vec()]);
+    }
+
+    #[gpui::test]
+    async fn test_restored_terminal_with_invalid_agent_session_runs_global_init_once(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command = Some("printf 'global-init\\n'".to_string());
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let metadata = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "Invalid restored terminal".into(),
+            custom_title: None,
+            created_at: Utc::now(),
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&[PathBuf::from(
+                "/worktree",
+            )])),
+            remote_connection: None,
+            working_directory: Some(PathBuf::from("/last-shell-cwd")),
+            agent_session: Some(TerminalAgentSession {
+                agent_id: "omp".to_string(),
+                resume_target: "bad'; command".to_string(),
+                working_directory: PathBuf::from("/invalid-session-cwd"),
+            }),
+        };
+        let terminal_id = metadata.terminal_id;
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.restore_test_terminal(
+                    metadata,
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .expect("test terminal should be restored");
+        cx.run_until_parked();
+
+        let terminal = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        let input_log = terminal.update(&mut cx, |terminal, _| terminal.take_input_log());
+        assert_eq!(input_log, vec![b"printf 'global-init\\n'\r".to_vec()]);
+        assert!(
+            input_log
+                .iter()
+                .all(|input| !input.starts_with(b"omp --resume")),
+            "invalid persisted sessions must never emit an OMP resume command"
         );
     }
 
@@ -7783,6 +8021,8 @@ mod tests {
                 true,
                 true,
                 true,
+                false,
+                None,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
@@ -7838,6 +8078,113 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_spawn_terminal_inherits_capture_environment(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command =
+                Some("printf 'capture=%s\\n' \"$ZED_TERMINAL_THREAD_ID\"".to_string());
+            AgentSettings::override_global(settings, cx);
+
+            let mut terminal_settings = TerminalSettings::get_global(cx).clone();
+            terminal_settings.shell = task::Shell::Program("/bin/sh".to_string());
+            TerminalSettings::override_global(terminal_settings, cx);
+        });
+
+        let terminal_id = TerminalId::new();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.spawn_terminal(
+                terminal_id,
+                None,
+                None,
+                None,
+                None,
+                true,
+                true,
+                true,
+                false,
+                None,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let content = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| terminal.view.read(cx).terminal().read(cx).get_content())
+            });
+            if content
+                .as_deref()
+                .is_some_and(|content| content.contains(&format!("capture={terminal_id}\n")))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capture environment was not inherited"
+            );
+            cx.executor().timer(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_metadata_save_preserves_reported_agent_session(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        let agent_session = TerminalAgentSession {
+            agent_id: "omp".to_string(),
+            resume_target: "omp-session-preserved".to_string(),
+            working_directory: PathBuf::from("/project"),
+        };
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_agent_session(terminal_id, Some(agent_session.clone()), cx);
+            });
+        });
+
+        let terminal_entity = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        terminal_entity.update(&mut cx, |terminal, cx| {
+            terminal.breadcrumb_text = "Changed title".to_string();
+            cx.emit(TerminalEvent::BreadcrumbsChanged);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let metadata = TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(terminal_id)
+                .unwrap();
+            assert_eq!(metadata.title.as_ref(), "Changed title");
+            assert_eq!(
+                metadata.agent_session.as_ref().unwrap().resume_target,
+                "omp-session-preserved",
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_restored_terminal_does_not_update_global_entry_kind(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -7865,6 +8212,7 @@ mod tests {
                 "/project",
             )])),
             remote_connection: None,
+            agent_session: None,
             working_directory: None,
         };
         panel
@@ -9284,6 +9632,7 @@ mod tests {
                     true,
                     true,
                     false,
+                    None,
                     AgentThreadSource::AgentPanel,
                     window,
                     cx,
@@ -9382,7 +9731,11 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
-        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let reporter_fs = fs.clone();
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            crate::terminal_agent_session::init(reporter_fs, cx);
+        });
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -9426,7 +9779,11 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
-        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let reporter_fs = fs.clone();
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            crate::terminal_agent_session::init(reporter_fs, cx);
+        });
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -9954,6 +10311,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10005,6 +10363,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
