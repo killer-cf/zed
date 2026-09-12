@@ -62,7 +62,7 @@ pub(crate) struct TerminalAgentSessionCapture {
     token: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TerminalAgentSessionReport {
     version: u8,
@@ -157,9 +157,6 @@ pub(crate) fn init(fs: Arc<dyn Fs>, cx: &mut App) {
 
 impl TerminalAgentSessionReporter {
     pub(crate) fn prepare_omp_extension(&mut self, cx: &mut App) -> Task<Result<()>> {
-        if self.captures.is_empty() {
-            return Task::ready(Ok(()));
-        }
 
         let fs = self.fs.clone();
         let extension_directory = home_dir().join(".omp/agent/extensions");
@@ -199,9 +196,18 @@ impl TerminalAgentSessionReporter {
             fs.create_file(&extension_path, CreateOptions::default())
                 .await
                 .context("creating OMP terminal session extension")?;
-            fs.write(&extension_path, OMP_EXTENSION.as_bytes())
-                .await
-                .context("writing OMP terminal session extension")?;
+            if let Err(error) = fs.write(&extension_path, OMP_EXTENSION.as_bytes()).await {
+                let _ = fs
+                    .remove_file(
+                        &extension_path,
+                        RemoveOptions {
+                            ignore_if_not_exists: true,
+                            ..RemoveOptions::default()
+                        },
+                    )
+                    .await;
+                return Err(error).context("writing OMP terminal session extension");
+            }
             Ok(())
         })
     }
@@ -389,6 +395,35 @@ mod tests {
         cx.run_until_parked();
     }
 
+    #[gpui::test]
+    async fn test_prepare_omp_extension_materializes_on_prepare_request(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| {
+            <dyn Fs>::set_global(fs.clone(), cx);
+            TerminalThreadMetadataStore::init_global(cx);
+            init(fs.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let prepare = cx.update(|cx| {
+            TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                reporter.prepare_omp_extension(cx)
+            })
+        });
+        prepare.await.expect("OMP extension should be materialized");
+
+        let extension_path = util::paths::home_dir()
+            .join(".omp/agent/extensions")
+            .join(OMP_EXTENSION_FILE_NAME);
+        let contents = fs
+            .load(&extension_path)
+            .await
+            .expect("materialized OMP extension should be readable");
+        assert!(contents.starts_with(MANAGED_EXTENSION_MARKER));
+    }
+
     fn metadata(terminal_id: TerminalId) -> TerminalThreadMetadata {
         TerminalThreadMetadata {
             terminal_id,
@@ -475,7 +510,7 @@ mod tests {
             resume_target: Some("omp_123-ABC".to_string()),
             working_directory: Some(PathBuf::from("/repo/session")),
         };
-        assert!(apply_report(cx, &capture.event_path, accepted));
+        assert!(apply_report(cx, &capture.event_path, accepted.clone()));
         cx.update(|cx| {
             let session = TerminalThreadMetadataStore::global(cx)
                 .read(cx)
@@ -506,19 +541,19 @@ mod tests {
             resume_target: Some("stale".to_string()),
             working_directory: Some(PathBuf::from("/repo/stale")),
         };
-        assert!(!apply_report(cx, &capture.event_path, rejected));
+        assert!(!apply_report(cx, &capture.event_path, rejected.clone()));
         rejected.token = capture.token.clone();
         rejected.terminal_id = other_terminal_id.to_key_string();
-        assert!(!apply_report(cx, &capture.event_path, rejected));
+        assert!(!apply_report(cx, &capture.event_path, rejected.clone()));
         rejected.terminal_id = terminal_id.to_key_string();
         rejected.agent_id = "unknown".to_string();
-        assert!(!apply_report(cx, &capture.event_path, rejected));
+        assert!(!apply_report(cx, &capture.event_path, rejected.clone()));
         rejected.agent_id = "omp".to_string();
         rejected.resume_target = Some("x'; rm -rf /".to_string());
-        assert!(!apply_report(cx, &capture.event_path, rejected));
+        assert!(!apply_report(cx, &capture.event_path, rejected.clone()));
         rejected.resume_target = Some("missing-cwd".to_string());
         rejected.working_directory = None;
-        assert!(!apply_report(cx, &capture.event_path, rejected));
+        assert!(!apply_report(cx, &capture.event_path, rejected.clone()));
         cx.update(|cx| {
             assert_eq!(
                 TerminalThreadMetadataStore::global(cx)
