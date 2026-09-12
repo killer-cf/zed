@@ -37,6 +37,7 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
+use mobile_server::MobileServer;
 use onboarding::{FIRST_OPEN, show_onboarding_view};
 use project_panel::ProjectPanel;
 use prompt_store::PromptBuilder;
@@ -687,6 +688,14 @@ fn main() {
             app_state.client.http_client(),
             credentials_provider,
             copilot_chat_configuration,
+            cx,
+        );
+        MobileServer::init(
+            mobile_server::MobileStore::new(
+                KeyValueStore::global(cx),
+                zed_credentials_provider::global(cx),
+            ),
+            paths::APP_NAME.into(),
             cx,
         );
 

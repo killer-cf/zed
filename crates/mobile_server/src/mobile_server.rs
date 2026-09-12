@@ -1,4 +1,6 @@
 pub mod mobile_store;
+pub mod mobile_window;
+pub use mobile_window::OpenControl;
 pub use mobile_store::{
     token_digest, token_matches, DeviceGrant, MobileBinding, MobileStore, MOBILE_CREDENTIALS_URL,
     MOBILE_HOST_KEY_USERNAME,
@@ -104,6 +106,11 @@ impl MobileServer {
             grants: Vec::new(),
             _grant_update_task: grant_update_task,
         });
+        mobile_window::init_mobile_window(cx);
+    }
+    /// Returns the Mobile server global when the control surface has been initialized.
+    pub fn try_global(cx: &App) -> Option<&Self> {
+        cx.try_global::<Self>()
     }
 
     pub fn enable(&mut self, binding: MobileBinding, cx: &mut App) -> Task<Result<()>> {
