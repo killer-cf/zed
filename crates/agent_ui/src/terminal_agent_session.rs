@@ -166,36 +166,23 @@ impl TerminalAgentSessionReporter {
                 .await
                 .context("creating OMP extension directory")?;
 
-            if let Some(metadata) = fs
-                .metadata(&extension_path)
-                .await
-                .context("checking OMP terminal session extension")?
-            {
-                if metadata.is_symlink || metadata.is_dir {
-                    anyhow::bail!(
-                        "OMP terminal session extension path is not a managed file: {}",
-                        extension_path.display()
-                    );
-                }
-
-                let contents = fs
-                    .load_bytes(&extension_path)
-                    .await
-                    .context("reading OMP terminal session extension")?;
-                if !contents.starts_with(MANAGED_EXTENSION_MARKER.as_bytes()) {
-                    anyhow::bail!(
-                        "OMP terminal session extension is owned by the user: {}",
-                        extension_path.display()
-                    );
-                }
+            if extension_is_managed(fs.as_ref(), &extension_path).await? {
                 return Ok(());
             }
 
             // Reserve the path without replacing a file that may have appeared since metadata
             // was read. Only the reserved file is populated with the managed extension.
-            fs.create_file(&extension_path, CreateOptions::default())
-                .await
-                .context("creating OMP terminal session extension")?;
+            match fs.create_file(&extension_path, CreateOptions::default()).await {
+                Ok(()) => {}
+                Err(error) => {
+                    return handle_extension_creation_error(
+                        fs.as_ref(),
+                        &extension_path,
+                        error,
+                    )
+                    .await;
+                }
+            }
             if let Err(error) = fs.write(&extension_path, OMP_EXTENSION.as_bytes()).await {
                 let _ = fs
                     .remove_file(
@@ -211,7 +198,56 @@ impl TerminalAgentSessionReporter {
             Ok(())
         })
     }
+}
 
+async fn extension_is_managed(fs: &dyn Fs, extension_path: &Path) -> Result<bool> {
+    let Some(metadata) = fs
+        .metadata(extension_path)
+        .await
+        .context("checking OMP terminal session extension")?
+    else {
+        return Ok(false);
+    };
+
+    if metadata.is_symlink || metadata.is_dir {
+        anyhow::bail!(
+            "OMP terminal session extension path is not a managed file: {}",
+            extension_path.display()
+        );
+    }
+
+    let contents = fs
+        .load_bytes(extension_path)
+        .await
+        .context("reading OMP terminal session extension")?;
+    if !contents.starts_with(MANAGED_EXTENSION_MARKER.as_bytes()) {
+        anyhow::bail!(
+            "OMP terminal session extension is owned by the user: {}",
+            extension_path.display()
+        );
+    }
+
+    Ok(true)
+}
+
+async fn handle_extension_creation_error(
+    fs: &dyn Fs,
+    extension_path: &Path,
+    error: anyhow::Error,
+) -> Result<()> {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+    }) && extension_is_managed(fs, extension_path).await?
+    {
+        return Ok(());
+    }
+
+    Err(error).context("creating OMP terminal session extension")
+}
+
+impl TerminalAgentSessionReporter {
     pub(crate) fn register_capture(
         &mut self,
         terminal_id: TerminalId,
@@ -250,6 +286,7 @@ impl TerminalAgentSessionReporter {
             token,
         }
     }
+
 
     pub(crate) fn unregister_capture(&mut self, terminal_id: TerminalId, cx: &mut App) {
         let Some(capture) = self.captures.remove(&terminal_id) else {
@@ -422,6 +459,28 @@ mod tests {
             .await
             .expect("materialized OMP extension should be readable");
         assert!(contents.starts_with(MANAGED_EXTENSION_MARKER));
+    }
+
+    #[gpui::test]
+    async fn test_existing_managed_omp_extension_wins_creation_race(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        let extension_path = util::paths::home_dir()
+            .join(".omp/agent/extensions")
+            .join(OMP_EXTENSION_FILE_NAME);
+        fs.create_dir(extension_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs.insert_file(&extension_path, OMP_EXTENSION.as_bytes().to_vec())
+            .await;
+
+        let already_exists = anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists,
+        ));
+        handle_extension_creation_error(fs.as_ref(), &extension_path, already_exists)
+            .await
+            .expect("an already-written managed extension should win the creation race");
     }
 
     fn metadata(terminal_id: TerminalId) -> TerminalThreadMetadata {
