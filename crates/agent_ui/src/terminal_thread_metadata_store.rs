@@ -44,6 +44,13 @@ impl TestTerminalMetadataDbName {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalAgentSession {
+    pub agent_id: String,
+    pub resume_target: String,
+    pub working_directory: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalThreadMetadata {
     pub terminal_id: TerminalId,
@@ -53,6 +60,7 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
+    pub agent_session: Option<TerminalAgentSession>,
 }
 
 impl TerminalThreadMetadata {
@@ -283,6 +291,23 @@ impl TerminalThreadMetadataStore {
         cx.notify();
     }
 
+    pub fn set_agent_session(
+        &mut self,
+        terminal_id: TerminalId,
+        agent_session: Option<TerminalAgentSession>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut metadata) = self.entry(terminal_id).cloned() else {
+            return;
+        };
+        if metadata.agent_session == agent_session {
+            return;
+        }
+        metadata.agent_session = agent_session;
+        self.save_internal(metadata);
+        cx.notify();
+    }
+
     pub fn rename_terminal(
         &mut self,
         terminal_id: TerminalId,
@@ -483,20 +508,25 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT
+            ) STRICT;
+        ),
+        sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_id TEXT;),
+        sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_resume_target TEXT;),
+        sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_working_directory TEXT;),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -506,7 +536,8 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
+            main_worktree_paths_order, remote_connection, agent_id, agent_resume_target, \
+            agent_working_directory \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -540,10 +571,18 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
+        let (agent_id, agent_resume_target, agent_working_directory) =
+            row.agent_session.map_or((None, None, None), |session| {
+                (
+                    Some(session.agent_id),
+                    Some(session.resume_target),
+                    Some(session.working_directory.to_string_lossy().into_owned()),
+                )
+            });
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent_id, agent_resume_target, agent_working_directory) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -553,7 +592,10 @@ impl TerminalThreadMetadataDb {
                            folder_paths_order = excluded.folder_paths_order, \
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection";
+                           remote_connection = excluded.remote_connection, \
+                           agent_id = excluded.agent_id, \
+                           agent_resume_target = excluded.agent_resume_target, \
+                           agent_working_directory = excluded.agent_working_directory";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -564,7 +606,10 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&folder_paths_order, i)?;
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&agent_id, i)?;
+            i = stmt.bind(&agent_resume_target, i)?;
+            stmt.bind(&agent_working_directory, i)?;
             stmt.exec()
         })
         .await
@@ -584,6 +629,23 @@ impl TerminalThreadMetadataDb {
     }
 }
 
+fn terminal_agent_session_from_columns(
+    agent_id: Option<String>,
+    resume_target: Option<String>,
+    working_directory: Option<String>,
+) -> Option<TerminalAgentSession> {
+    match (agent_id, resume_target, working_directory) {
+        (Some(agent_id), Some(resume_target), Some(working_directory)) => {
+            Some(TerminalAgentSession {
+                agent_id,
+                resume_target,
+                working_directory: PathBuf::from(working_directory),
+            })
+        }
+        _ => None,
+    }
+}
+
 impl Column for TerminalThreadMetadata {
     fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
         let (terminal_id, next): (String, i32) = Column::column(statement, start_index)?;
@@ -599,6 +661,11 @@ impl Column for TerminalThreadMetadata {
         let (main_worktree_paths_order_str, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (agent_id, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (agent_resume_target, next): (Option<String>, i32) =
+            Column::column(statement, next)?;
+        let (agent_working_directory, next): (Option<String>, i32) =
             Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
@@ -624,6 +691,11 @@ impl Column for TerminalThreadMetadata {
             .map(serde_json::from_str::<RemoteConnectionOptions>)
             .transpose()
             .context("deserialize terminal thread remote connection")?;
+        let agent_session = terminal_agent_session_from_columns(
+            agent_id,
+            agent_resume_target,
+            agent_working_directory,
+        );
 
         let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
             .unwrap_or_else(|_| WorktreePaths::default());
@@ -639,6 +711,7 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
+                agent_session,
             },
             next,
         ))
@@ -668,6 +741,7 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         }
     }
 
@@ -736,6 +810,89 @@ mod tests {
             assert_eq!(metadata.custom_title, None);
             assert_eq!(metadata.display_title().as_ref(), "⠋ Dev Server");
         });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_agent_session_is_saved_replaced_and_cleared(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut terminal_metadata = metadata(
+            "OMP",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        let terminal_id = terminal_metadata.terminal_id;
+        terminal_metadata.agent_session = Some(TerminalAgentSession {
+            agent_id: "omp".to_string(),
+            resume_target: "session-one".to_string(),
+            working_directory: PathBuf::from("/repo/one"),
+        });
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(terminal_metadata, cx);
+                store.set_agent_session(
+                    terminal_id,
+                    Some(TerminalAgentSession {
+                        agent_id: "omp".to_string(),
+                        resume_target: "session-two".to_string(),
+                        working_directory: PathBuf::from("/repo/two"),
+                    }),
+                    cx,
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            assert_eq!(
+                store.read(cx).entry(terminal_id).unwrap().agent_session,
+                Some(TerminalAgentSession {
+                    agent_id: "omp".to_string(),
+                    resume_target: "session-two".to_string(),
+                    working_directory: PathBuf::from("/repo/two"),
+                }),
+            );
+        });
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_agent_session(terminal_id, None, cx);
+            });
+        });
+        cx.update(|cx| {
+            assert!(
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .unwrap()
+                    .agent_session
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn test_terminal_agent_session_decoder_requires_complete_columns() {
+        assert_eq!(
+            terminal_agent_session_from_columns(
+                Some("omp".to_string()),
+                Some("session-one".to_string()),
+                Some("/repo/one".to_string()),
+            ),
+            Some(TerminalAgentSession {
+                agent_id: "omp".to_string(),
+                resume_target: "session-one".to_string(),
+                working_directory: PathBuf::from("/repo/one"),
+            }),
+        );
+        assert_eq!(
+            terminal_agent_session_from_columns(
+                Some("omp".to_string()),
+                None,
+                Some("/repo/one".to_string()),
+            ),
+            None,
+        );
+        assert_eq!(terminal_agent_session_from_columns(None, None, None), None);
     }
 
     #[gpui::test]
