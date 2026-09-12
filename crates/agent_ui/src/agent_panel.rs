@@ -39,6 +39,7 @@ use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
+use crate::terminal_agent_session::TerminalAgentSessionReporter;
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
@@ -76,8 +77,8 @@ use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
     Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
-    PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
-    pulsating_between,
+    PlatformDisplay, Subscription, Task, TaskExt, UpdateGlobal as _, WeakEntity, WindowHandle,
+    prelude::*, pulsating_between,
 };
 use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
@@ -2075,17 +2076,68 @@ impl AgentPanel {
     ) {
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(run_init_command, cx);
-        let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
-        });
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
-        let project = self.project.downgrade();
+        let project = self.project.clone();
 
         cx.spawn_in(window, async move |this, cx| {
+            let is_local =
+                project.read_with(cx, |project, cx| project.remote_connection_options(cx).is_none());
+            let (terminal_task, capture_registered) = if is_local {
+                let prepare = cx.update(|_, cx| {
+                    TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                        reporter.prepare_omp_extension(cx)
+                    })
+                })?;
+                match prepare.await {
+                    Ok(()) => {
+                        let capture = cx.update(|_, cx| {
+                            TerminalAgentSessionReporter::update_global(
+                                cx,
+                                |reporter, _cx| reporter.register_capture(terminal_id),
+                            )
+                        })?;
+                        let terminal_task = project.update(cx, |project, cx| {
+                            project.create_terminal_shell_with_environment(
+                                working_directory,
+                                capture.environment,
+                                cx,
+                            )
+                        });
+                        (terminal_task, true)
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "failed to prepare OMP terminal session extension: {error:#}"
+                        );
+                        workspace
+                            .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                            .log_err();
+                        let terminal_task = project
+                            .update(cx, |project, cx| {
+                                project.create_terminal_shell(working_directory, cx)
+                            });
+                        (terminal_task, false)
+                    }
+                }
+            } else {
+                let terminal_task =
+                    project.update(cx, |project, cx| {
+                        project.create_terminal_shell(working_directory, cx)
+                    });
+                (terminal_task, false)
+            };
+
             let terminal = match terminal_task.await {
                 Ok(terminal) => terminal,
                 Err(error) => {
+                    if capture_registered {
+                        let _ = cx.update(|_, cx| {
+                            TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                                reporter.unregister_capture(terminal_id, cx);
+                            });
+                        });
+                    }
                     log::error!("failed to spawn agent panel terminal: {error:#}");
                     workspace
                         .update(cx, |workspace, cx| workspace.show_error(error, cx))
@@ -2103,8 +2155,14 @@ impl AgentPanel {
             this.update_in(cx, |this, window, cx| {
                 let terminal_for_init_command = terminal.clone();
                 let terminal_view = cx.new(|cx| {
-                    let mut view =
-                        TerminalView::new(terminal, workspace, workspace_id, project, window, cx);
+                    let mut view = TerminalView::new(
+                        terminal,
+                        workspace,
+                        workspace_id,
+                        project.downgrade(),
+                        window,
+                        cx,
+                    );
                     view.set_show_workspace_actions(false, cx);
                     view
                 });
@@ -2333,6 +2391,11 @@ impl AgentPanel {
         if self.terminals.remove(&terminal_id).is_none() {
             return;
         }
+        if cx.has_global::<TerminalAgentSessionReporter>() {
+            TerminalAgentSessionReporter::update_global(cx, |reporter, cx| {
+                reporter.unregister_capture(terminal_id, cx);
+            });
+        }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
                 store.delete(terminal_id, cx);
@@ -2422,6 +2485,12 @@ impl AgentPanel {
         cx: &App,
     ) -> Option<TerminalThreadMetadata> {
         let terminal = self.terminals.get(&terminal_id)?;
+        let agent_session = TerminalThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry(terminal_id)
+                .and_then(|metadata| metadata.agent_session.clone())
+        });
         let project = self.project.read(cx);
         Some(TerminalThreadMetadata {
             terminal_id,
@@ -2431,6 +2500,7 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            agent_session,
         })
     }
 
@@ -6887,6 +6957,7 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::NewWorktreeBranchTarget;
+    use crate::terminal_thread_metadata_store::TerminalAgentSession;
     use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -6906,7 +6977,7 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn install_custom_agent(id: &str, cx: &mut App) {
         SettingsStore::update_global(cx, |store, cx| {
@@ -7609,6 +7680,7 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7692,6 +7764,7 @@ mod tests {
                 "/project",
             )])),
             remote_connection: None,
+            agent_session: None,
             working_directory: None,
         };
         let terminal_id = metadata.terminal_id;
@@ -7838,6 +7911,111 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_spawn_terminal_inherits_capture_environment(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.executor().allow_parking();
+        cx.update(|_, cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.terminal_init_command =
+                Some("printf 'capture=%s\\n' \"$ZED_TERMINAL_THREAD_ID\"".to_string());
+            AgentSettings::override_global(settings, cx);
+
+            let mut terminal_settings = TerminalSettings::get_global(cx).clone();
+            terminal_settings.shell = task::Shell::Program("/bin/sh".to_string());
+            TerminalSettings::override_global(terminal_settings, cx);
+        });
+
+        let terminal_id = TerminalId::new();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.spawn_terminal(
+                terminal_id,
+                None,
+                None,
+                None,
+                None,
+                true,
+                true,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let content = panel.read_with(&cx, |panel, cx| {
+                panel
+                    .terminals
+                    .get(&terminal_id)
+                    .map(|terminal| terminal.view.read(cx).terminal().read(cx).get_content())
+            });
+            if content
+                .as_deref()
+                .is_some_and(|content| content.contains(&format!("capture={terminal_id}\n")))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "capture environment was not inherited");
+            cx.executor().timer(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_metadata_save_preserves_reported_agent_session(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("OMP", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        let agent_session = TerminalAgentSession {
+            agent_id: "omp".to_string(),
+            resume_target: "omp-session-preserved".to_string(),
+            working_directory: PathBuf::from("/project"),
+        };
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_agent_session(terminal_id, Some(agent_session.clone()), cx);
+            });
+        });
+
+        let terminal_entity = panel.read_with(&cx, |panel, cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should remain in the panel")
+                .view
+                .read(cx)
+                .terminal()
+                .clone()
+        });
+        terminal_entity.update(&mut cx, |terminal, cx| {
+            terminal.breadcrumb_text = "Changed title".to_string();
+            cx.emit(TerminalEvent::BreadcrumbsChanged);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let metadata = TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(terminal_id)
+                .unwrap();
+            assert_eq!(metadata.title.as_ref(), "Changed title");
+            assert_eq!(
+                metadata.agent_session.as_ref().unwrap().resume_target,
+                "omp-session-preserved",
+            );
+        });
+    }
+
+
     #[gpui::test]
     async fn test_restored_terminal_does_not_update_global_entry_kind(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
@@ -7865,6 +8043,7 @@ mod tests {
                 "/project",
             )])),
             remote_connection: None,
+            agent_session: None,
             working_directory: None,
         };
         panel
@@ -9382,7 +9561,11 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
-        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let reporter_fs = fs.clone();
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            crate::terminal_agent_session::init(reporter_fs, cx);
+        });
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -9426,7 +9609,11 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
-        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        let reporter_fs = fs.clone();
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs.clone(), cx);
+            crate::terminal_agent_session::init(reporter_fs, cx);
+        });
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -9954,6 +10141,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10005,6 +10193,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {

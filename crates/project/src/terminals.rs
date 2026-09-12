@@ -286,7 +286,16 @@ impl Project {
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        self.create_terminal_shell_internal(cwd, false, cx)
+        self.create_terminal_shell_internal(cwd, false, HashMap::default(), cx)
+    }
+
+    pub fn create_terminal_shell_with_environment(
+        &mut self,
+        cwd: Option<PathBuf>,
+        additional_environment: HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_shell_internal(cwd, false, additional_environment, cx)
     }
 
     /// Creates a local terminal even if the project is remote.
@@ -303,7 +312,7 @@ impl Project {
             // Local project: use project directory like normal terminals
             self.active_project_directory(cx).map(|p| p.to_path_buf())
         };
-        self.create_terminal_shell_internal(working_directory, true, cx)
+        self.create_terminal_shell_internal(working_directory, true, HashMap::default(), cx)
     }
 
     /// Internal method for creating terminal shells.
@@ -313,6 +322,7 @@ impl Project {
         &mut self,
         cwd: Option<PathBuf>,
         force_local: bool,
+        additional_environment: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let path = cwd.map(|p| Arc::from(&*p));
@@ -374,8 +384,13 @@ impl Project {
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
             let shell_kind = ShellKind::new(&shell, path_style.is_windows());
-            let mut env = env_task.await.unwrap_or_default();
-            env.extend(settings.env);
+            let resolved_environment = env_task.await.unwrap_or_default();
+            let env = merge_terminal_environment(
+                resolved_environment,
+                settings.env,
+                additional_environment,
+                is_via_remote,
+            );
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -605,6 +620,19 @@ impl Project {
     }
 }
 
+fn merge_terminal_environment(
+    mut resolved_environment: HashMap<String, String>,
+    settings_environment: HashMap<String, String>,
+    additional_environment: HashMap<String, String>,
+    is_via_remote: bool,
+) -> HashMap<String, String> {
+    resolved_environment.extend(settings_environment);
+    if !is_via_remote {
+        resolved_environment.extend(additional_environment);
+    }
+    resolved_environment
+}
+
 fn create_remote_shell(
     spawn_command: Option<(&String, &Vec<String>)>,
     mut env: HashMap<String, String>,
@@ -712,6 +740,29 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn capture_environment_overrides_settings_for_local_terminals() {
+        let environment = merge_terminal_environment(
+            HashMap::from([("PATH".into(), "/bin".into())]),
+            HashMap::from([("ZED_AGENT_SESSION_TOKEN".into(), "setting".into())]),
+            HashMap::from([("ZED_AGENT_SESSION_TOKEN".into(), "capture".into())]),
+            false,
+        );
+        assert_eq!(environment["ZED_AGENT_SESSION_TOKEN"], "capture");
+    }
+
+    #[test]
+    fn capture_environment_is_excluded_from_remote_terminals() {
+        let environment = merge_terminal_environment(
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::from([("ZED_AGENT_SESSION_TOKEN".into(), "capture".into())]),
+            true,
+        );
+        assert!(!environment.contains_key("ZED_AGENT_SESSION_TOKEN"));
+    }
+
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {
