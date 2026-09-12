@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use uuid::Uuid;
+use tokio::sync::Mutex as AsyncMutex;
 use zeroize::Zeroizing;
 
 pub const MOBILE_CREDENTIALS_URL: &str = "zed://mobile-server";
@@ -54,6 +55,7 @@ pub struct DeviceGrant {
 pub struct MobileStore {
     key_value_store: KeyValueStore,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    grant_mutation_lock: Arc<AsyncMutex<()>>,
 }
 
 impl MobileStore {
@@ -64,6 +66,7 @@ impl MobileStore {
         Self {
             key_value_store,
             credentials_provider,
+            grant_mutation_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -125,9 +128,9 @@ impl MobileStore {
         validate_binding(&binding)?;
         Ok(Some(binding))
     }
-
     pub async fn insert_grant(&self, grant: DeviceGrant) -> Result<()> {
         validate_grant(&grant)?;
+        let _mutation_guard = self.grant_mutation_lock.lock().await;
         let mut grants = self.read_grants()?;
         ensure!(
             grants.iter().all(|existing| existing.id != grant.id),
@@ -138,6 +141,7 @@ impl MobileStore {
     }
 
     pub async fn grant(&self, id: Uuid) -> Result<Option<DeviceGrant>> {
+        let _mutation_guard = self.grant_mutation_lock.lock().await;
         Ok(self
             .read_grants()?
             .into_iter()
@@ -145,10 +149,12 @@ impl MobileStore {
     }
 
     pub async fn grants(&self) -> Result<Vec<DeviceGrant>> {
+        let _mutation_guard = self.grant_mutation_lock.lock().await;
         self.read_grants()
     }
 
     pub async fn revoke_grant(&self, id: Uuid, at: OffsetDateTime) -> Result<bool> {
+        let _mutation_guard = self.grant_mutation_lock.lock().await;
         let mut grants = self.read_grants()?;
         let Some(grant) = grants.iter_mut().find(|grant| grant.id == id) else {
             return Ok(false);
