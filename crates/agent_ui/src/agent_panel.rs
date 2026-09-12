@@ -7972,7 +7972,7 @@ mod tests {
         cx.update(|_, cx| TerminalThreadMetadataStore::init_global(cx));
         let terminal_id = panel
             .update_in(&mut cx, |panel, window, cx| {
-                panel.insert_test_terminal("OMP", true, window, cx)
+                panel.insert_test_terminal("", true, window, cx)
             })
             .expect("test terminal should be inserted");
         let agent_session = TerminalAgentSession {
