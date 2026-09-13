@@ -31,6 +31,46 @@ pnpm typecheck
 pnpm lint
 ```
 
+## CI checks
+
+The generated `run_tests` workflow runs the mobile checks independently when
+`mobile/**`, the workflow generator, or the generated mobile CI configuration
+changes. It installs Node 24 and pnpm 9, caches `mobile/pnpm-lock.yaml`, and
+runs the same frozen install, test, typecheck, and lint commands listed above.
+
+The package declares `pnpm@9.15.9`. When pnpm is not installed globally, use
+the pinned package through npm:
+
+```bash
+npm exec --yes --package=pnpm@9.15.9 -- pnpm --dir mobile test
+npm exec --yes --package=pnpm@9.15.9 -- pnpm --dir mobile typecheck
+npm exec --yes --package=pnpm@9.15.9 -- pnpm --dir mobile lint
+```
+
+## Real-device Tailscale acceptance
+
+Run this sequence only on a non-production development host and a phone that
+are authenticated to the same tailnet, with a development-client build of
+Zed Mobile. Record only pass/fail/not-run results in the pull request; never
+record QR contents, pairing URLs, tokens, keys, prompts, or terminal output.
+
+1. Enable Mobile in Zed, select the host's Tailscale address (`100.x.x.x` or
+   the `fd7a:115c:a1e0::/48` range), and keep port `6769`.
+2. Generate an offer, scan it in the development build, and confirm one host
+   appears as `connected`, with protocol version 1 and only the status
+   capability.
+3. Background the phone, disable and re-enable its Tailscale route, then
+   foreground the app. Confirm the dashboard reconnects or visibly reaches
+   `unreachable` with a working `Retry` action.
+4. Revoke the phone from Zed's Mobile control window. Confirm the phone becomes
+   `revoked`, its secure profile is removed, and it cannot reconnect.
+5. Generate a second offer and pair again. Close and reopen Zed without
+   changing the binding or port, then confirm the app reconnects to the stable
+   endpoint.
+
+If the host, phone, or tailnet is unavailable, mark the acceptance not run
+instead of substituting a simulated result.
+
 To launch the native development client, use `pnpm --dir mobile start` after installing the platform prerequisites. The only registered deep-link scheme is `zed-mobile://pair?code=...`.
 
 ## Protocol boundary

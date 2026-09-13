@@ -24,6 +24,8 @@ pub use check_run_patterns::validate_run_command;
 pub struct WorkflowValidationArgs {}
 
 pub fn validate(_: WorkflowValidationArgs) -> Result<()> {
+    validate_generated_run_tests()?;
+
     let (parsing_errors, file_errors): (Vec<_>, Vec<_>) = get_all_workflow_files()
         .map(check_workflow)
         .flat_map(Result::err)
@@ -51,6 +53,147 @@ pub fn validate(_: WorkflowValidationArgs) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_generated_run_tests() -> Result<()> {
+    const MOBILE_COMMANDS: [&str; 4] = [
+        "pnpm --dir mobile install --frozen-lockfile",
+        "pnpm --dir mobile test",
+        "pnpm --dir mobile typecheck",
+        "pnpm --dir mobile lint",
+    ];
+
+    let workflow_path = Path::new(".github/workflows/run_tests.yml");
+    let workflow = WorkflowFile::load(workflow_path)?;
+    let jobs = workflow
+        .parsed_content
+        .get("jobs")
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| anyhow!("Generated run_tests.yml is missing its jobs map"))?;
+    let mobile_job = jobs
+        .get("check_mobile")
+        .ok_or_else(|| anyhow!("Generated run_tests.yml is missing the check_mobile job"))?;
+    if mobile_job.get("if").and_then(Value::as_str)
+        != Some("needs.orchestrate.outputs.run_mobile_checks == 'true'")
+    {
+        return Err(anyhow!(
+            "Generated check_mobile job must be gated by run_mobile_checks"
+        ));
+    }
+
+    let mobile_steps = mobile_job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .ok_or_else(|| anyhow!("Generated check_mobile job is missing its steps"))?;
+
+    let has_pnpm_9 = mobile_steps.iter().any(|step| {
+        step.get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|uses| uses.starts_with("pnpm/action-setup@"))
+            && step
+                .get("with")
+                .and_then(Value::as_mapping)
+                .and_then(|with| with.get("version"))
+                .and_then(Value::as_str)
+                == Some("9")
+    });
+    if !has_pnpm_9 {
+        return Err(anyhow!(
+            "Generated check_mobile job must install pnpm 9 with pnpm/action-setup"
+        ));
+    }
+
+    let node_setup = mobile_steps
+        .iter()
+        .find(|step| {
+            step.get("uses")
+                .and_then(Value::as_str)
+                .is_some_and(|uses| uses.starts_with("actions/setup-node@"))
+        })
+        .ok_or_else(|| {
+            anyhow!("Generated check_mobile job must use actions/setup-node")
+        })?;
+    let node_with = node_setup
+        .get("with")
+        .and_then(Value::as_mapping)
+        .ok_or_else(|| anyhow!("Generated actions/setup-node step is missing its with map"))?;
+    if node_with.get("node-version").and_then(Value::as_str) != Some("24") {
+        return Err(anyhow!(
+            "Generated check_mobile job must configure Node version 24"
+        ));
+    }
+    if node_with.get("cache").and_then(Value::as_str) != Some("pnpm")
+        || node_with.get("cache-dependency-path").and_then(Value::as_str)
+            != Some("mobile/pnpm-lock.yaml")
+    {
+        return Err(anyhow!(
+            "Generated check_mobile job must cache pnpm using mobile/pnpm-lock.yaml"
+        ));
+    }
+
+    let runs: Vec<&str> = mobile_steps
+        .iter()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .collect();
+    for command in MOBILE_COMMANDS {
+        if !runs.contains(&command) {
+            return Err(anyhow!(
+                "Generated check_mobile job is missing command: {command}"
+            ));
+        }
+    }
+
+    let orchestrate_run = jobs
+        .get("orchestrate")
+        .and_then(|job| job.get("steps"))
+        .and_then(Value::as_sequence)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find_map(|step| step.get("run").and_then(Value::as_str))
+        })
+        .ok_or_else(|| anyhow!("Generated orchestrate job is missing its filter script"))?;
+    for path in [
+        "check_pattern \"run_mobile_checks\"",
+        "mobile/",
+        r"tooling/xtask/src/tasks/workflows/run_tests\.rs",
+        r"\.github/workflows/run_tests\.yml",
+    ] {
+        if !orchestrate_run.contains(path) {
+            return Err(anyhow!(
+                "Generated orchestrate job must detect mobile CI changes matching {path:?}"
+            ));
+        }
+    }
+
+    let tests_pass = jobs
+        .get("tests_pass")
+        .ok_or_else(|| anyhow!("Generated run_tests.yml is missing the tests_pass job"))?;
+    let needs_mobile = tests_pass
+        .get("needs")
+        .and_then(Value::as_sequence)
+        .is_some_and(|needs| needs.iter().any(|need| need.as_str() == Some("check_mobile")));
+    if !needs_mobile {
+        return Err(anyhow!(
+            "Generated tests_pass job must depend on check_mobile"
+        ));
+    }
+    let gate_run = tests_pass
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find_map(|step| step.get("run").and_then(Value::as_str))
+        })
+        .ok_or_else(|| anyhow!("Generated tests_pass job is missing its gate script"))?;
+    if !gate_run.contains("check_result \"check_mobile\"") {
+        return Err(anyhow!(
+            "Generated tests_pass job must check the check_mobile result"
+        ));
+    }
+
+    Ok(())
 }
 
 struct WorkflowFile {

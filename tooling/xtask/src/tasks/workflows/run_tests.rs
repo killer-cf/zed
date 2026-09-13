@@ -38,16 +38,22 @@ pub(crate) fn run_tests() -> Workflow {
     );
     let should_check_licences =
         PathCondition::new("run_licenses", r"^(Cargo.lock|script/.*licenses)");
+    let should_run_mobile_checks = PathCondition::new(
+        "run_mobile_checks",
+        r"^(mobile/|tooling/xtask/src/tasks/workflows/run_tests\.rs|\.github/workflows/run_tests\.yml)",
+    );
 
     let orchestrate = orchestrate(&[
         &should_check_scripts,
         &should_check_docs,
         &should_check_licences,
         &should_run_tests,
+        &should_run_mobile_checks,
     ]);
 
     let mut jobs = vec![
         orchestrate,
+        should_run_mobile_checks.and_always().then(check_mobile()),
         check_style(),
         should_run_tests
             .and_not_in_merge_queue()
@@ -420,6 +426,41 @@ pub(crate) fn run_ts_query_ls(context: RunContext) -> Step<Run> {
             RunContext::ZedRepository => ".",
         }
     ))
+}
+
+fn check_mobile() -> NamedJob {
+    fn install_mobile_dependencies() -> Step<Run> {
+        named::bash("pnpm --dir mobile install --frozen-lockfile")
+    }
+
+    fn run_mobile_tests() -> Step<Run> {
+        named::bash("pnpm --dir mobile test")
+    }
+
+    fn run_mobile_typecheck() -> Step<Run> {
+        named::bash("pnpm --dir mobile typecheck")
+    }
+
+    fn run_mobile_lint() -> Step<Run> {
+        named::bash("pnpm --dir mobile lint")
+    }
+
+    named::job(
+        release_job(&[])
+            .runs_on(runners::LINUX_SMALL)
+            .add_step(steps::harden_runner())
+            .add_step(steps::checkout_repo())
+            .add_step(steps::setup_pnpm())
+            .add_step(
+                steps::setup_node()
+                    .add_with(("cache", "pnpm"))
+                    .add_with(("cache-dependency-path", "mobile/pnpm-lock.yaml")),
+            )
+            .add_step(install_mobile_dependencies())
+            .add_step(run_mobile_tests())
+            .add_step(run_mobile_typecheck())
+            .add_step(run_mobile_lint()),
+    )
 }
 
 fn check_style() -> NamedJob {
