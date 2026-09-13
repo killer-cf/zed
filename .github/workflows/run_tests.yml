@@ -116,6 +116,7 @@ jobs:
         check_pattern "run_docs" '^(docs/|crates/.*\.rs)' -qP
         check_pattern "run_licenses" '^(Cargo.lock|script/.*licenses)' -qP
         check_pattern "run_tests" '^(docs/|script/update_top_ranking_issues/|\.github/(ISSUE_TEMPLATE|workflows/(?!run_tests))|extensions/)' -qvP
+        check_pattern "run_mobile_checks" '^(mobile/|tooling/xtask/src/tasks/workflows/run_tests\.rs|\.github/workflows/run_tests\.yml)' -qP
         # Detect changed extension directories (excluding extensions/workflows)
         CHANGED_EXTENSIONS=$(echo "$CHANGED_FILES" | grep -oP '^extensions/[^/]+(?=/)' | sort -u | grep -v '^extensions/workflows$' || true)
         # Filter out deleted extensions
@@ -138,7 +139,43 @@ jobs:
       run_docs: ${{ steps.filter.outputs.run_docs }}
       run_licenses: ${{ steps.filter.outputs.run_licenses }}
       run_tests: ${{ steps.filter.outputs.run_tests }}
+      run_mobile_checks: ${{ steps.filter.outputs.run_mobile_checks }}
       changed_extensions: ${{ steps.filter.outputs.changed_extensions }}
+  check_mobile:
+    needs:
+    - orchestrate
+    if: needs.orchestrate.outputs.run_mobile_checks == 'true'
+    runs-on: namespace-profile-2x4-ubuntu-2404
+    steps:
+    - name: steps::harden_runner
+      uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411
+      with:
+        egress-policy: audit
+    - name: steps::checkout_repo
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        clean: false
+    - name: steps::setup_pnpm
+      uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+      with:
+        version: '9'
+    - name: steps::setup_node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        check-latest: true
+        package-manager-cache: false
+        cache: pnpm
+        cache-dependency-path: mobile/pnpm-lock.yaml
+    - name: run_tests::check_mobile::install_mobile_dependencies
+      run: pnpm --dir mobile install --frozen-lockfile
+    - name: run_tests::check_mobile::run_mobile_tests
+      run: pnpm --dir mobile test
+    - name: run_tests::check_mobile::run_mobile_typecheck
+      run: pnpm --dir mobile typecheck
+    - name: run_tests::check_mobile::run_mobile_lint
+      run: pnpm --dir mobile lint
+    timeout-minutes: 60
   check_style:
     if: (github.repository_owner == 'zed-industries' || github.repository_owner == 'zed-extensions')
     runs-on: namespace-profile-4x8-ubuntu-2204
@@ -904,6 +941,7 @@ jobs:
   tests_pass:
     needs:
     - orchestrate
+    - check_mobile
     - check_style
     - clippy_windows
     - clippy_linux
@@ -936,6 +974,7 @@ jobs:
         }
 
         check_result "orchestrate" "$RESULT_ORCHESTRATE"
+        check_result "check_mobile" "$RESULT_CHECK_MOBILE"
         check_result "check_style" "$RESULT_CHECK_STYLE"
         check_result "clippy_windows" "$RESULT_CLIPPY_WINDOWS"
         check_result "clippy_linux" "$RESULT_CLIPPY_LINUX"
@@ -958,6 +997,7 @@ jobs:
         exit $EXIT_CODE
       env:
         RESULT_ORCHESTRATE: ${{ needs.orchestrate.result }}
+        RESULT_CHECK_MOBILE: ${{ needs.check_mobile.result }}
         RESULT_CHECK_STYLE: ${{ needs.check_style.result }}
         RESULT_CLIPPY_WINDOWS: ${{ needs.clippy_windows.result }}
         RESULT_CLIPPY_LINUX: ${{ needs.clippy_linux.result }}

@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Zed Mobile",
+    "slug": "zed-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "zed-mobile",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Zed Mobile uses your camera to scan a pairing code from Zed Desktop."
+        }
+      ],
+      "expo-router"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

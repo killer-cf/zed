@@ -61,3 +61,10 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+.expo/
+mobile/node_modules/
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/ios/Pods/
+mobile/ios/build/
+mobile/.env*
