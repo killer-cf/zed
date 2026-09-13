@@ -122,21 +122,84 @@ zeroize.workspace = true
 
 - [ ] **Step 2: Write failing protocol round-trip and rejection tests**
 
-Add tests for a complete version-one pairing offer, a `status.get` request with a UUID operation ID, an authenticated status response, and every invalid envelope case. The concrete contract is:
+Add tests for a complete version-one pairing offer, a `status.get` request with a UUID operation ID, an authenticated status response, and every invalid envelope case. Build a real offer in the test fixture instead of using a placeholder:
 
 ```rust
-assert_eq!(MOBILE_PROTOCOL_VERSION, 1);
-assert_eq!(MIN_COMPATIBLE_MOBILE_VERSION, 1);
+let offer = test_pairing_offer();
+let encoded_offer = offer.encode_url()?;
 assert_eq!(
-    PairingOffer::decode_url("zed-mobile://pair?code=<valid-base64url>")?.endpoint,
+    PairingOffer::decode_url(&encoded_offer)?.endpoint,
     "ws://100.88.4.2:6769"
 );
 assert!(PairingOffer::decode_url("orca://pair?code=abc").is_err());
 assert!(PairingOffer::decode_url("zed-mobile://pair?code=not-json").is_err());
-assert!(ClientFrame::from_json(r#"{\"type\":\"status.get\"}"#).is_err());
+assert!(ClientFrame::from_json(
+    r#"{"type":"request","request_id":"00000000-0000-0000-0000-000000000000","operation_id":null,"method":"status.get","params":{}}"#
+).is_ok());
+assert!(ClientFrame::from_json(
+    r#"{"type":"request","method":"status.get","params":{}}"#
+).is_err());
 ```
 
 Cover `Capability` serialization in stable snake case and reject unknown fields with `serde(deny_unknown_fields)` on every externally decoded struct.
+
+Add these exact `ServerFrame` variants:
+
+```rust
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ServerFrame {
+    PairChallenge {
+        offer_id: Uuid,
+        client_nonce: String,
+        server_nonce: String,
+        host_signature: String,
+    },
+    PairComplete { grant_id: Uuid, token: String },
+    ServerChallenge {
+        grant_id: Uuid,
+        client_nonce: String,
+        server_nonce: String,
+        host_signature: String,
+    },
+    Authenticated { grant_id: Uuid },
+    Response {
+        request_id: Uuid,
+        operation_id: Option<Uuid>,
+        result: serde_json::Value,
+    },
+    Event { event: String, payload: serde_json::Value },
+    Pong { nonce: String },
+    Error {
+        request_id: Option<Uuid>,
+        code: String,
+        message: String,
+    },
+}
+```
+
+`Status` contains exactly `host_name: String`, `protocol_version: u16`, `minimum_compatible_mobile_version: u16`, and a sorted `Vec<Capability>`. `PairingOffer::encode_url` and `decode_url` must accept only the exact `zed-mobile` scheme, `pair` host, one `code` query parameter, padded or unpadded base64url input, and an RFC 3339 expiry.
+
+Define these function signatures and field order in this crate:
+
+```rust
+pub fn pairing_payload(
+    protocol_version: u16,
+    offer_id: Uuid,
+    client_nonce: &str,
+    server_nonce: &str,
+) -> Result<Vec<u8>, ProtocolError>;
+pub fn authentication_payload(
+    protocol_version: u16,
+    grant_id: Uuid,
+    client_nonce: &str,
+    server_nonce: &str,
+    token_digest: &[u8; 32],
+) -> Result<Vec<u8>, ProtocolError>;
+```
+
+Both produce the bytes that Ed25519 signs and verifies. Encode no challenge material as JSON: begin with the literal domain (`zed-mobile/pair/v1` or `zed-mobile/auth/v1`), then append protocol version as big-endian `u16`, UUID bytes, and each nonce/digest as a big-endian `u32` byte length followed by its decoded bytes, in the function parameter order above. Add fixed hex vectors for both functions and require the TypeScript mirror to match them byte-for-byte.
+
 
 - [ ] **Step 3: Run the protocol tests to verify they fail**
 
@@ -238,6 +301,13 @@ pub const MOBILE_CREDENTIALS_URL: &str = "zed://mobile-server";
 pub const MOBILE_HOST_KEY_USERNAME: &str = "host-signing-key";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MobileBinding {
+    pub enabled: bool,
+    pub address: IpAddr,
+    pub port: NonZeroU16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeviceGrant {
     pub id: Uuid,
     pub label: String,
@@ -251,6 +321,10 @@ pub struct DeviceGrant {
 pub struct MobileStore;
 
 impl MobileStore {
+    pub fn new(
+        key_value_store: KeyValueStore,
+        credentials_provider: Arc<dyn CredentialsProvider>,
+    ) -> Self;
     pub async fn load_or_create_host_key(&self, cx: &AsyncApp) -> anyhow::Result<SigningKey>;
     pub async fn save_binding(&self, binding: MobileBinding) -> anyhow::Result<()>;
     pub async fn load_binding(&self) -> anyhow::Result<Option<MobileBinding>>;
@@ -417,7 +491,7 @@ known     → Connect → ServerChallenge → Authenticate → Authenticated
 
 `PairChallenge` and `ServerChallenge` use the `pairing_payload` and `authentication_payload` byte encoders from `mobile_protocol`; do not reconstruct a signing payload independently in server or app code. Verify the signature in test clients against the QR-pinned public key before transmitting `pairing_secret` or `token`. `PairComplete` checks the one-use offer, expiry, secret digest, device label length, client Ed25519 public key, and a signature over the exact pairing payload. It creates a random 256-bit grant token, persists only its digest, and returns the raw token once. `Authenticate` checks the active grant and token digest, then verifies the device signature over the exact authentication payload.
 
-Track each authenticated socket by grant ID. `revoke_grant` persists the revocation first, signals every matching socket to close, removes it from the registry, and emits an updated `MobileServerStatus`. `status.get` is rejected before authentication and responds only with protocol versions, host name, endpoint health, and the foundation capability list.
+Track each authenticated socket by grant ID. `revoke_grant` persists the revocation first, signals every matching socket to close, removes it from the registry, and emits an updated `MobileServerStatus`. `status.get` is rejected before authentication and responds with the exact `Status` DTO: protocol versions, host name, and the foundation capability list. Endpoint health remains transport-local in `MobileServerStatus`; do not add a wire field outside the Task 1 `Status` contract.
 
 - [ ] **Step 5: Run the focused Rust suites**
 
@@ -448,7 +522,7 @@ git commit -m "Add Tailscale mobile server"
 
 **Interfaces:**
 - Consumes: `AppDatabase`, `KeyValueStore`, `zed_credentials_provider::global`, `MobileServer`, and GPUI window/clipboard primitives.
-- Produces: `zed_mobile::OpenControl`, a self-registering command-palette action that opens a native Mobile control window with server state, safe address/port selection, `Enable`, `Disable`, `Generate pairing QR`, `Copy pairing code`, paired-device list, and per-device `Revoke`.
+- Produces: `mobile_server::OpenControl`, a self-registering command-palette action that opens a native Mobile control window with server state, safe address/port selection, `Enable`, `Disable`, `Generate pairing QR`, `Copy pairing code`, paired-device list, and per-device `Revoke`.
 
 - [ ] **Step 1: Write failing window-state and redaction tests in the new crate**
 
@@ -484,7 +558,7 @@ Expected: compile failure because the Mobile control action/window/model do not 
 Add only the direct `mobile_server` and any already-required direct `db`/`zed_credentials_provider` dependencies to `crates/zed/Cargo.toml`. In `main.rs`, after `AppDatabase` and `zed_credentials_provider` are globally available, construct `MobileStore` from the existing `KeyValueStore` and call:
 
 ```rust
-mobile_server::init(mobile_store, app_name.into(), cx);
+MobileServer::init(mobile_store, app_name.into(), cx);
 ```
 
 The initializer owns global action registration, control-window creation, server teardown registration, and every Mobile UI detail. Do not register an action in `zed`, modify an app menu, add a settings field, or touch `settings_ui`. The startup delta must remain one initialization statement plus imports.
@@ -506,7 +580,7 @@ pub fn init_mobile_window(cx: &mut App) {
 }
 ```
 
-Call `init_mobile_window` only from `mobile_server::init`. `MobileControlWindow` owns its `MobileControlModel`, renders the server/grant snapshot entirely from `MobileServer::try_global`, and calls only `MobileServer::{enable,disable,create_pairing_offer,revoke_grant}`. Address selection comes from `tailscale_addresses()`; it never shells out to `tailscale` or offers a manual unsafe address. The pairing display renders `pairing_offer_svg(&offer)` and its expiry, while `Copy pairing code` is the only control that reads the raw URL for the existing clipboard API. Register the action with the command palette through the normal action inventory; no source change in `command_palette` is allowed.
+Call `init_mobile_window` only from `MobileServer::init`. `MobileControlWindow` owns its `MobileControlModel`, renders the server/grant snapshot entirely from `MobileServer::try_global`, and calls only `MobileServer::{enable,disable,create_pairing_offer,revoke_grant}`. Address selection comes from `tailscale_addresses()`; it never shells out to `tailscale` or offers a manual unsafe address. The pairing display renders `pairing_offer_svg(&offer)` and its expiry, while `Copy pairing code` is the only control that reads the raw URL for the existing clipboard API. Register the action with the command palette through the normal action inventory; no source change in `command_palette` is allowed.
 
 - [ ] **Step 5: Run focused window and integration checks**
 
@@ -616,6 +690,7 @@ git commit -m "Add mobile companion project"
 ### Task 6: Implement pairing, secure host persistence, and host status UI
 
 **Files:**
+- Modify: `mobile/vitest.config.ts`
 - Create: `mobile/src/storage/paired-host-store.ts`
 - Create: `mobile/src/storage/paired-host-store.test.ts`
 - Create: `mobile/src/transport/mobile-rpc-client.ts`
@@ -685,7 +760,7 @@ Assert the client verifies the server signature against `hostPublicKey` before i
 
 - [ ] **Step 2: Run the new tests to verify they fail**
 
-Run: `pnpm --dir mobile test -- mobile/src/storage/paired-host-store.test.ts mobile/src/transport/mobile-rpc-client.test.ts`
+Run: `pnpm --dir mobile test -- src/storage/paired-host-store.test.ts src/transport/mobile-rpc-client.test.ts`
 
 Expected: FAIL because the secure-store adapter and client do not exist.
 
@@ -701,12 +776,8 @@ Set a heartbeat timer while connected. When the WebSocket stops receiving respon
 
 `app/index.tsx` loads paired hosts, shows host display name/endpoint/connection state/protocol block reason, supports `Pair host`, `Retry`, and `Remove`, and renders an empty state. It contains no fake worktree/thread/account cards; those arrive only when their server capabilities exist.
 
-- [ ] **Step 5: Run focused mobile tests and type checks**
-
-Run:
-
 ```bash
-pnpm --dir mobile test -- mobile/src/storage/paired-host-store.test.ts mobile/src/transport/mobile-rpc-client.test.ts mobile/src/features/pairing/pairing-code.test.ts mobile/app/index.test.tsx mobile/app/pair.test.tsx
+pnpm --dir mobile test -- src/storage/paired-host-store.test.ts src/transport/mobile-rpc-client.test.ts src/features/pairing/pairing-code.test.ts app/index.test.tsx app/pair.test.tsx
 pnpm --dir mobile typecheck
 pnpm --dir mobile lint
 ```
@@ -716,7 +787,7 @@ Expected: PASS. Tests show QR/paste/deep-link convergence, no duplicate pairing,
 - [ ] **Step 6: Commit the operational pairing client**
 
 ```bash
-git add mobile/src/storage mobile/src/transport mobile/src/features/pairing mobile/app
+git add mobile/vitest.config.ts mobile/src/storage mobile/src/transport mobile/src/features/pairing mobile/app
 git commit -m "Add mobile host pairing"
 ```
 

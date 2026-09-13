@@ -1,6 +1,6 @@
 # Companion mobile do Zed via Tailscale
 
-**Status:** Design aprovado pelo usuário; aguardando revisão desta especificação.
+**Status:** Design aprovado pelo usuário.
 
 ## Objetivo
 
