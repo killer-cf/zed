@@ -114,6 +114,13 @@ impl MobileServer {
     }
 
     pub fn enable(&mut self, binding: MobileBinding, cx: &mut App) -> Task<Result<()>> {
+        {
+            let state = lock_state(&self.context);
+            if state.shutdown_tx.is_some() {
+                return Task::ready(Err(anyhow!("mobile server is already enabled")));
+            }
+        }
+
         if let Err(error) = validate_listener_binding(&binding) {
             set_error(&self.context, "mobile binding is not a Tailscale address");
             return Task::ready(Err(error));
@@ -122,11 +129,7 @@ impl MobileServer {
         {
             let mut state = lock_state(&self.context);
             if state.shutdown_tx.is_some() {
-                let error = anyhow!("mobile server is already enabled");
-                state.status = MobileServerStatus::Error {
-                    message: SharedString::from("mobile server is already enabled"),
-                };
-                return Task::ready(Err(error));
+                return Task::ready(Err(anyhow!("mobile server is already enabled")));
             }
             state.endpoint = Some(endpoint_for(binding.address, binding.port));
             state.status = MobileServerStatus::Starting;
@@ -1871,6 +1874,157 @@ mod tests {
             .expect_err("retry should report the storage error again");
         assert!(!second_error.to_string().contains("already enabled"));
     }
+    #[gpui::test]
+    async fn duplicate_enable_preserves_live_server_status_and_qr(
+        cx: &gpui::TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+
+        use std::{future::Future, pin::Pin};
+
+        use credentials_provider::CredentialsProvider;
+
+        struct EmptyCredentials;
+
+        impl CredentialsProvider for EmptyCredentials {
+            fn read_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn write_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _username: &'a str,
+                _password: &'a [u8],
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn delete_credentials<'a>(
+                &'a self,
+                _url: &'a str,
+                _cx: &'a gpui::AsyncApp,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let database =
+            db::kvp::KeyValueStore::open_test_db("mobile_server_duplicate_enable").await;
+        let store = MobileStore::new(database, Arc::new(EmptyCredentials));
+        cx.update(|app| MobileServer::init(store, "Zed Desktop".into(), app));
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("an ephemeral test port should be available");
+        let port = listener
+            .local_addr()
+            .expect("test listener should have a local address")
+            .port();
+        drop(listener);
+        let binding = MobileBinding {
+            enabled: true,
+            address: "127.0.0.1".parse().expect("loopback address should parse"),
+            port: NonZeroU16::new(port).expect("ephemeral port should be nonzero"),
+        };
+
+        let first = cx.update(|app| {
+            app.update_global::<MobileServer, _>(|server, app| {
+                server.enable(binding.clone(), app)
+            })
+        });
+        let duplicate_starting = cx.update(|app| {
+            app.update_global::<MobileServer, _>(|server, app| {
+                server.enable(binding.clone(), app)
+            })
+        });
+        let duplicate_starting_error = duplicate_starting
+            .await
+            .expect_err("duplicate enable should fail while startup is in progress");
+        assert!(
+            duplicate_starting_error
+                .to_string()
+                .contains("already enabled")
+        );
+        assert_eq!(
+            cx.update(|app| app.global::<MobileServer>().status()),
+            MobileServerStatus::Starting
+        );
+
+        first.await.expect("initial enable should start the listener");
+        assert!(matches!(
+            cx.update(|app| app.global::<MobileServer>().status()),
+            MobileServerStatus::Listening { .. }
+        ));
+
+        let offer = cx
+            .update(|app| {
+                app.update_global::<MobileServer, _>(|server, _| {
+                    server.create_pairing_offer(OffsetDateTime::now_utc())
+                })
+            })
+            .expect("a listening server should generate a pairing offer");
+        let qr = pairing_offer_svg(&offer).expect("a pairing offer should render as QR");
+        assert!(qr.starts_with("<svg "));
+
+        let duplicate_listening = cx.update(|app| {
+            app.update_global::<MobileServer, _>(|server, app| {
+                server.enable(binding.clone(), app)
+            })
+        });
+        let duplicate_listening_error = duplicate_listening
+            .await
+            .expect_err("duplicate enable should fail while listening");
+        assert!(
+            duplicate_listening_error
+                .to_string()
+                .contains("already enabled")
+        );
+        assert_eq!(
+            cx.update(|app| app.global::<MobileServer>().status()),
+            MobileServerStatus::Listening {
+                endpoint: offer.endpoint.clone(),
+                connected_devices: 0,
+            }
+        );
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test Tokio runtime should build")
+            .block_on(async {
+                let mut socket = connect_websocket(port).await;
+                send_client_frame(
+                    &mut socket,
+                    &ClientFrame::PairBegin {
+                        offer_id: offer.offer_id,
+                        client_nonce: random_base64_token(),
+                    },
+                )
+                .await;
+                match read_server_frame(&mut socket).await {
+                    ServerFrame::PairChallenge { offer_id, .. } => {
+                        assert_eq!(offer_id, offer.offer_id)
+                    }
+                    frame => panic!("expected a pairing challenge, got {frame:?}"),
+                }
+                drop(socket);
+            });
+
+        let disable = cx.update(|app| {
+            app.update_global::<MobileServer, _>(|server, app| server.disable(app))
+        });
+        disable.await.expect("listener should disable cleanly");
+        assert_eq!(
+            cx.update(|app| app.global::<MobileServer>().status()),
+            MobileServerStatus::Disabled
+        );
+    }
+
     #[gpui::test]
     async fn pairing_challenge_is_pinned_and_offer_is_one_use(cx: &gpui::TestAppContext) {
         use std::{future::Future, pin::Pin};
